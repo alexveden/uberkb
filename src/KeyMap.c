@@ -43,7 +43,11 @@ KeyMap_create(KeyMap_c* self, char* input_dev_or_name)
         };
         bool is_qwerty = KeyMap.is_qwerty_keyboard(self->input.dev);
         if (!is_qwerty) {
-            return e$raise(Error.argument, "Input device: %s is not qwerty keyboard", input_dev_or_name);
+            return e$raise(
+                Error.argument,
+                "Input device: %s is not qwerty keyboard",
+                input_dev_or_name
+            );
         }
         if (self->debug) {
             char* sys_kbd_name = (char*)libevdev_get_name(self->input.dev);
