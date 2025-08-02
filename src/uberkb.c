@@ -50,6 +50,16 @@ main(int argc, char** argv)
                 [KEY_X] = KEY_CUT,
                 [KEY_C] = KEY_COPY,
                 [KEY_V] = KEY_PASTE,
+                // Make mod keys work inside alt-mode
+                [KEY_LEFTCTRL] = KEY_LEFTCTRL,
+                [KEY_LEFTMETA] = KEY_LEFTMETA,
+                [KEY_LEFTSHIFT] = KEY_LEFTSHIFT,
+                [KEY_LEFTALT] = 0, // disabled, it's a modkey!
+                [KEY_COMPOSE] = KEY_COMPOSE,
+                [KEY_RIGHTALT] = KEY_RIGHTALT,
+                [KEY_RIGHTCTRL] = KEY_RIGHTCTRL,
+                [KEY_RIGHTSHIFT] = KEY_RIGHTSHIFT,
+                [KEY_RIGHTMETA] = KEY_RIGHTMETA,
             },
             .direct_map = {
                 [KEY_CAPSLOCK] = KEY_ESC, 
