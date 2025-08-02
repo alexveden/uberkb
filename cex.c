@@ -4,8 +4,12 @@
 #    include "cex_config.h"
 #else
 // Overriding config values
-#    define cexy$cc_include "-I.", "-I./lib"
-#    define CEX_LOG_LVL 4 /* 0 (mute all) - 5 (log$trace) */
+#    if defined(CEX_DEBUG)
+#        define CEX_LOG_LVL 4 /* 0 (mute all) - 5 (log$trace) */
+#    else
+#        define cexy$cc_args "-Wall", "-Wextra", "-Werror", "-g", "-O3", "-fwhole-program"
+#        define cexy$cc_args_sanitizer "-fstack-protector-strong"
+#    endif
 #endif
 
 #define cexy$pkgconf_libs "libevdev"
@@ -56,22 +60,25 @@ cmd_install(int argc, char** argv, void* user_ctx)
     };
     e$ret(argparse.parse(&cmd_args, argc, argv));
     char* keyboard_name = argparse.next(&cmd_args);
-    if (keyboard_name == NULL){
+    if (keyboard_name == NULL) {
         argparse.usage(&cmd_args);
         return Error.argument;
     }
     char* sys_service = "/etc/systemd/system/uberkb.service";
-    char* sys_exec = "/usr/local/uberkb";
+    char* sys_exec = "/usr/local/bin/uberkb";
 
     mem$scope(tmem$, _)
     {
         // Copy new version
         e$assert(os.path.exists(cexy$build_dir "/uberkb"));
-        if (os.path.exists(sys_exec)){
+
+        if (os.path.exists(sys_exec)) {
+            log$info("Removing old uberkb\n");
             e$ret(os.fs.remove(sys_exec));
         }
+
         log$info("Copy executable to %s\n", sys_exec);
-        e$ret(os.fs.copy(cexy$build_dir"/uberkb", sys_exec));
+        e$ret(os.fs.copy(cexy$build_dir "/uberkb", sys_exec));
         e$ret(os$cmd("chown", "root:root", sys_exec));
         e$ret(os$cmd("chmod", "700", sys_exec));
 
@@ -81,7 +88,6 @@ cmd_install(int argc, char** argv, void* user_ctx)
 
         char* template_service = io.file.load("uberkb.service", _);
         e$assert(template_service);
-        io.printf("%s\n", template_service);
 
         char* service_txt = str.replace(template_service, "{KBD_NAME}", keyboard_name, _);
         e$assert(service_txt);

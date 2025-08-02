@@ -74,7 +74,7 @@ KeyMap_find_mapped_keyboard(KeyMap_c* self, char* keyboard_name)
     (void)keyboard_name;
     mem$scope(tmem$, _)
     {
-        io.printf("Looking for keyboard: '%s'", keyboard_name);
+        io.printf("Looking for keyboard: '%s'\n", keyboard_name);
         for$each (it, os.fs.find("/dev/input/event*", false, _)) {
             e$except_errno (self->input.fd = open(it, O_RDONLY)) {
                 log$error("Error opening: %s\n", it);
