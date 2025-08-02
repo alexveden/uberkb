@@ -30,8 +30,10 @@ struct __cex_namespace__KeyMap {
 
     Exception       (*create)(KeyMap_c* self, char* input_dev);
     void            (*destroy)(KeyMap_c* self);
+    Exception       (*find_mapped_keyboard)(KeyMap_c* self, char* keyboard_name);
     Exception       (*handle_events)(KeyMap_c* self);
     Exception       (*handle_key)(KeyMap_c* self, struct input_event* ev);
+    bool            (*is_qwerty_keyboard)(struct libevdev* dev);
 
     // clang-format on
 };

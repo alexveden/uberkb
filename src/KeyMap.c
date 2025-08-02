@@ -1,11 +1,13 @@
 #include "KeyMap.h"
 #include "cex.h"
+#include "libevdev/libevdev.h"
 #include <fcntl.h>
 #include <linux/input-event-codes.h>
 #include <linux/input.h>
+#include <stdbool.h>
 
 Exception
-KeyMap_create(KeyMap_c* self, char* input_dev)
+KeyMap_create(KeyMap_c* self, char* input_dev_or_name)
 {
     uassert(self->input.fd == 0 && "already initialized or non ZII");
     uassert(!self->mod_pressed && "non ZII?");
@@ -30,24 +32,33 @@ KeyMap_create(KeyMap_c* self, char* input_dev)
     e$except_errno (ioctl(self->output.fd, UI_DEV_CREATE)) { goto err; }
 
     // Attaching for input keyboard
-    e$except_errno (self->input.fd = open(input_dev, O_RDONLY)) { goto err; }
-    e$except_errno (libevdev_new_from_fd(self->input.fd, &self->input.dev)) { goto err; };
+    if (str.starts_with(input_dev_or_name, "/dev/")) {
+        e$except_errno (self->input.fd = open(input_dev_or_name, O_RDONLY)) {
+            log$error("Error opening: %s\n", input_dev_or_name);
+            goto err;
+        }
+        e$except_errno (libevdev_new_from_fd(self->input.fd, &self->input.dev)) {
+            log$error("Error opening: %s\n", input_dev_or_name);
+            goto err;
+        };
+        bool is_qwerty = KeyMap.is_qwerty_keyboard(self->input.dev);
+        if (!is_qwerty) {
+            return e$raise(Error.argument, "Input device: %s is not qwerty keyboard", input_dev_or_name);
+        }
+        if (self->debug) {
+            char* sys_kbd_name = (char*)libevdev_get_name(self->input.dev);
+            printf("Keyboard FOUND\n");
+            printf("Evdev version: %x\n", libevdev_get_driver_version(self->input.dev));
+            printf("Input device name: \"%s\"\n", sys_kbd_name);
+            printf("Phys location: %s\n", libevdev_get_phys(self->input.dev));
+            printf("Uniq identifier: %s\n", libevdev_get_uniq(self->input.dev));
+            printf("Is Qwetry Keyboard: %d\n", is_qwerty);
+        }
+    } else {
+        e$ret(KeyMap.find_mapped_keyboard(self, input_dev_or_name));
+    }
+    if (self->debug) {}
 
-    char* kbd_name = (char*)libevdev_get_name(self->input.dev);
-    printf(
-        "Input device ID: bus %#x vendor %#x product %#x\n",
-        libevdev_get_id_bustype(self->input.dev),
-        libevdev_get_id_vendor(self->input.dev),
-        libevdev_get_id_product(self->input.dev)
-    );
-    printf("Evdev version: %x\n", libevdev_get_driver_version(self->input.dev));
-    printf("Input device name: \"%s\"\n", kbd_name);
-    printf("Phys location: %s\n", libevdev_get_phys(self->input.dev));
-    printf("Uniq identifier: %s\n", libevdev_get_uniq(self->input.dev));
-
-    uassert(
-        str.find(kbd_name, "Microsoft") && "Microsoft Natural® Ergonomic Keyboard 4000 expected"
-    );
     e$except_errno (libevdev_grab(self->input.dev, LIBEVDEV_GRAB)) { goto err; }
 
     return EOK;
@@ -56,6 +67,88 @@ err:
     return Error.io;
 }
 
+Exception
+KeyMap_find_mapped_keyboard(KeyMap_c* self, char* keyboard_name)
+{
+    (void)self;
+    (void)keyboard_name;
+    mem$scope(tmem$, _)
+    {
+        io.printf("Looking for keyboard: '%s'", keyboard_name);
+        for$each (it, os.fs.find("/dev/input/event*", false, _)) {
+            e$except_errno (self->input.fd = open(it, O_RDONLY)) {
+                log$error("Error opening: %s\n", it);
+                goto err;
+            }
+            e$except_errno (libevdev_new_from_fd(self->input.fd, &self->input.dev)) {
+                log$error("Error opening: %s\n", it);
+                goto err;
+            };
+
+            char* sys_kbd_name = (char*)libevdev_get_name(self->input.dev);
+            bool is_qwerty = KeyMap.is_qwerty_keyboard(self->input.dev);
+
+            printf(
+                "%s: Input device name: '%s' Phys: '%s' is_qwerty: %d\n",
+                it,
+                sys_kbd_name,
+                libevdev_get_phys(self->input.dev),
+                is_qwerty
+            );
+
+            if (is_qwerty && str.eq(sys_kbd_name, keyboard_name)) {
+                if (self->debug) {
+                    printf("Keyboard FOUND\n");
+                    printf("Evdev version: %x\n", libevdev_get_driver_version(self->input.dev));
+                    printf("Input device name: \"%s\"\n", sys_kbd_name);
+                    printf("Phys location: %s\n", libevdev_get_phys(self->input.dev));
+                    printf("Uniq identifier: %s\n", libevdev_get_uniq(self->input.dev));
+                    printf("Is Qwetry Keyboard: %d\n", is_qwerty);
+                }
+                return EOK;
+            } else {
+                if (self->input.dev) {
+                    libevdev_free(self->input.dev);
+                    self->input.dev = NULL;
+                }
+                if (self->input.fd > 0) {
+                    close(self->input.fd);
+                    self->input.fd = -1;
+                }
+            }
+        }
+    }
+
+    return e$raise(Error.not_found, "No such keyboard name: '%s'", keyboard_name);
+err:
+    if (self->input.dev) {
+        libevdev_free(self->input.dev);
+        self->input.dev = NULL;
+    }
+    if (self->input.fd > 0) {
+        close(self->input.fd);
+        self->input.fd = -1;
+    }
+    return Error.io;
+}
+
+
+bool
+KeyMap_is_qwerty_keyboard(struct libevdev* dev)
+{
+    if (!libevdev_has_event_type(dev, EV_KEY)) { return false; }
+    if (!libevdev_has_event_code(dev, EV_KEY, KEY_Q)) { return false; }
+    if (!libevdev_has_event_code(dev, EV_KEY, KEY_W)) { return false; }
+    if (!libevdev_has_event_code(dev, EV_KEY, KEY_E)) { return false; }
+    if (!libevdev_has_event_code(dev, EV_KEY, KEY_ESC)) { return false; }
+    if (!libevdev_has_event_code(dev, EV_KEY, KEY_CAPSLOCK)) { return false; }
+
+    // NOTE: some keyboards may have more than 1 inputs, with qwerty, usually input0 works
+    char* phys_loc = (char*)libevdev_get_phys(dev);
+    if (!str.ends_with(phys_loc, "/input0")) { return false; }
+
+    return true;
+}
 
 static int
 print_event(struct input_event* ev)
@@ -109,6 +202,9 @@ KeyMap_handle_key(KeyMap_c* self, struct input_event* ev)
                 e$except_errno (write(self->output.fd, ev, sizeof(*ev))) { return Error.io; }
             }
         }
+    } else {
+        // Weird key code, but still fallback to the event propagation
+        e$except_errno (write(self->output.fd, ev, sizeof(*ev))) { return Error.io; }
     }
 
     return EOK;
@@ -171,8 +267,10 @@ const struct __cex_namespace__KeyMap KeyMap = {
 
     .create = KeyMap_create,
     .destroy = KeyMap_destroy,
+    .find_mapped_keyboard = KeyMap_find_mapped_keyboard,
     .handle_events = KeyMap_handle_events,
     .handle_key = KeyMap_handle_key,
+    .is_qwerty_keyboard = KeyMap_is_qwerty_keyboard,
 
     // clang-format on
 };

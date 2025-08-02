@@ -9,7 +9,7 @@ main(int argc, char** argv)
 {
     int result = 1;
     KeyMap_c keymap = {
-        // .debug = true,
+        .debug = true,
         .mod_key_code = KEY_LEFTALT,
         .mod_map = {
             [KEY_I] = KEY_UP, 
