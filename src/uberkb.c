@@ -1,3 +1,4 @@
+#include <stdbool.h>
 #define CEX_IMPLEMENTATION
 #include "KeyMap.c"
 #include "KeyMap.h"
@@ -13,6 +14,8 @@ main(int argc, char** argv)
     char* file = argv[1];
     if (argc < 2) {
         fprintf(stderr, "usage: uberkb /dev/input/eventN or 'My Keyboard Name'\n");
+        keymap.debug = true;
+        if(KeyMap.find_mapped_keyboard(&keymap, "")){};
         goto end;
     }
 
