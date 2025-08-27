@@ -189,11 +189,33 @@ KeyMap_handle_key(KeyMap_c* self, struct input_event* ev)
 
     if (ev->code < KEY_MAX) {
         if (self->mod_key_code && ev->code == self->mod_key_code) {
+            // Special case (bug) when MOD key released before arrow key,
+            //   it was leading to infinite key loop
+            if (self->mod_pressed && ev->value == 0 && self->last_key_mod) {
+                ev->type = EV_MSC;
+                ev->code = MSC_SCAN;
+                ev->value = self->last_key_mod;
+                e$except_errno (write(self->output.fd, ev, sizeof(*ev))) { return Error.io; }
+
+                ev->type = EV_KEY;
+                ev->code = self->last_key_mod;
+                ev->value = 0;
+                e$except_errno (write(self->output.fd, ev, sizeof(*ev))) { return Error.io; }
+
+                ev->type = EV_SYN;
+                ev->code = SYN_REPORT;
+                ev->value = 0;
+                e$except_errno (write(self->output.fd, ev, sizeof(*ev))) { return Error.io; }
+            }
             self->mod_pressed = ev->value > 0;
+            self->last_key_mod = 0;
         } else {
             if (self->mod_pressed) {
                 if (self->mod_map[ev->code]) {
                     ev->code = self->mod_map[ev->code];
+                    if (ev->value == 2) {
+                        self->last_key_mod = ev->code;
+                    }
                     e$except_errno (write(self->output.fd, ev, sizeof(*ev))) { return Error.io; }
 
                     ev->type = EV_SYN;

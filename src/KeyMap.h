@@ -20,6 +20,7 @@ typedef struct KeyMap_c
     bool debug;
     bool mod_pressed;
     u16 mod_key_code;
+    u16 last_key_mod;
     u16 direct_map[KEY_CNT];
     u16 mod_map[KEY_CNT];
 } KeyMap_c;
