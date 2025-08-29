@@ -1,5 +1,5 @@
-#include <stdbool.h>
 #define CEX_IMPLEMENTATION
+#include <stdbool.h>
 #include "KeyMap.c"
 #include "KeyMap.h"
 #include "cex.h"
@@ -31,7 +31,7 @@ main(int argc, char** argv)
             },
             .mouse_key_code = KEY_LEFTMETA,
             .mouse_sensitivity = 1.0,
-            .mouse_sensitivity_precise = 0.2,
+            .mouse_speedup_ms = 300,
             .mouse_map = {
                 [KEY_SPACE] = BTN_LEFT,
                 [KEY_J] = KEY_LEFT,

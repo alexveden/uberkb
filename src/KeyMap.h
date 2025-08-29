@@ -20,17 +20,18 @@ typedef struct KeyMap_c
     struct
     {
         struct libevdev_uinput *dev;
-        i32 up;
-        i16 down;
-        i16 left;
-        i16 right;
+        u64 last_press_ts;
+        bool up;
+        bool down;
+        bool left;
+        bool right;
     } mouse;
 
     bool debug;
     bool mod_pressed;
     bool mouse_pressed;
     f32 mouse_sensitivity;
-    f32 mouse_sensitivity_precise;
+    u64 mouse_speedup_ms;
     u16 mod_key_code;
     u16 mouse_key_code;
     u16 last_key_mod;

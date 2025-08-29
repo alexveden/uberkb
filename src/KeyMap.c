@@ -121,15 +121,11 @@ KeyMap_create(KeyMap_c* self, char* input_dev_or_name)
                 self->mouse_sensitivity
             );
         }
-        if (self->mouse_sensitivity_precise <= 0) {
-            self->mouse_sensitivity_precise = 1.0f;
-        } else {
-            uassertf(
-                self->mouse_sensitivity_precise < 10 && self->mouse_sensitivity_precise > 0.1,
-                "mouse_sensitivity_precise expected in (0.1;10) got: %0.3f",
-                self->mouse_sensitivity_precise
-            );
-        }
+        uassertf(
+            self->mouse_speedup_ms > 0 && self->mouse_speedup_ms < 10000,
+            "mouse_speedup_ms weird value: %lu",
+            self->mouse_speedup_ms
+        );
 
         libevdev_free(dev);
     }
@@ -249,6 +245,19 @@ print_event(struct input_event* ev)
     return 0;
 }
 
+static u64
+get_monotonic_time_ms()
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == -1) {
+        unreachable("clock_gettime CLOCK_MONOTONIC failed");
+        return 0;
+    }
+
+    return (u64)ts.tv_sec * 1000 + (u64)ts.tv_nsec / 1000000;
+}
+
 Exception
 KeyMap_mouse_movement(KeyMap_c* self, int rel_x, int rel_y)
 {
@@ -366,6 +375,8 @@ KeyMap_handle_key(KeyMap_c* self, struct input_event* ev)
     if (ev->code < KEY_MAX) {
         if (self->mouse_key_code && ev->code == self->mouse_key_code) {
             self->mouse_pressed = ev->value > 0;
+            self->mouse.last_press_ts = 0;
+
             if (!self->mouse_pressed) {
                 self->mouse.left = false;
                 self->mouse.right = false;
@@ -419,16 +430,16 @@ KeyMap_handle_key(KeyMap_c* self, struct input_event* ev)
                             break;
                         // NOTE: movements are handled in KeyMap_handle_events
                         case KEY_RIGHT:
-                            self->mouse.right = ev->value;
+                            self->mouse.right = ev->value > 0;
                             break;
                         case KEY_LEFT:
-                            self->mouse.left = ev->value;
+                            self->mouse.left = ev->value > 0;
                             break;
                         case KEY_UP:
-                            self->mouse.up = ev->value;
+                            self->mouse.up = ev->value > 0;
                             break;
                         case KEY_DOWN:
-                            self->mouse.down = ev->value;
+                            self->mouse.down = ev->value > 0;
                             break;
                         default:
                             unreachable("Unsupported mouse btn or event");
@@ -455,44 +466,35 @@ KeyMap_handle_mouse_move(KeyMap_c* self)
     // Initial direction
     int x = 0;
     int y = 0;
-
-    // mouse.up/down/left/right - 1 when single press, 2 when hold (i.e. faster move)
-    if (self->mouse.up) {
-        y = -10;
-        if (self->mouse.up > 1) {
-            y *= self->mouse_sensitivity;
-        } else {
-            y *= self->mouse_sensitivity_precise;
-        }
-    }
-    if (self->mouse.down) {
-        y = 10;
-        if (self->mouse.down > 1) {
-            y *= self->mouse_sensitivity;
-        } else {
-            y *= self->mouse_sensitivity_precise;
-        }
-    }
-    if (self->mouse.left) {
-        x = -10;
-        if (self->mouse.left > 1) {
-            x *= self->mouse_sensitivity;
-        } else {
-            x *= self->mouse_sensitivity_precise;
-        }
-    }
-    if (self->mouse.right) {
-        x = 10;
-        if (self->mouse.right > 1) {
-            x *= self->mouse_sensitivity;
-        } else {
-            x *= self->mouse_sensitivity_precise;
-        }
-    }
+    if (self->mouse.up) { y = -10; }
+    if (self->mouse.down) { y = 10; }
+    if (self->mouse.left) { x = -10; }
+    if (self->mouse.right) { x = 10; }
 
     if (x != 0 || y != 0) {
+        u64 ts = get_monotonic_time_ms();
+        if (self->mouse.last_press_ts == 0) { self->mouse.last_press_ts = ts; }
+
+        f32 speed = self->mouse_sensitivity;
+        u64 speedup_interval_ms = self->mouse_speedup_ms;
+        u64 delta = ts - self->mouse.last_press_ts;
+
+        if (delta < speedup_interval_ms) {
+            if (delta < speedup_interval_ms / 10) {
+                speed *= 0.1;
+            } else {
+                speed *= ((f64)delta / (f64)speedup_interval_ms);
+            }
+        }
+        if (speed < 0.1f) { speed = 0.1f; }
+        x *= speed;
+        y *= speed;
+
         if (self->debug) { printf("Mouse move x=%d y=%d\n", x, y); }
         e$ret(KeyMap.mouse_movement(self, x, y));
+    } else {
+        // No cursor button, help reset speed
+        self->mouse.last_press_ts = 0;
     }
 
     return EOK;
