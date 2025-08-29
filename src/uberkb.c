@@ -33,14 +33,17 @@ main(int argc, char** argv)
             .mouse_sensitivity = 1.0,
             .mouse_speedup_ms = 500,
             .mouse_map = {
+                // Buttons
                 [KEY_SPACE] = BTN_LEFT,
                 [KEY_N] = BTN_RIGHT,
+                // Wheel
+                [KEY_Y] = BTN_GEAR_UP,
+                [KEY_H] = BTN_GEAR_DOWN,
+                // Cursor
                 [KEY_J] = KEY_LEFT,
                 [KEY_L] = KEY_RIGHT,
                 [KEY_I] = KEY_UP,
                 [KEY_K] = KEY_DOWN,
-                [KEY_Y] = BTN_GEAR_UP,
-                [KEY_H] = BTN_GEAR_DOWN,
             },
 
             // For testing only
