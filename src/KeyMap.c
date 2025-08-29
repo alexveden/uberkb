@@ -1,10 +1,15 @@
 #include "KeyMap.h"
 #include "cex.h"
 #include "libevdev/libevdev.h"
+#include <asm-generic/errno-base.h>
 #include <fcntl.h>
+#include <libevdev/libevdev-uinput.h>
 #include <linux/input-event-codes.h>
 #include <linux/input.h>
+#include <poll.h>
 #include <stdbool.h>
+#include <stdio.h>
+#include <unistd.h>
 
 Exception
 KeyMap_create(KeyMap_c* self, char* input_dev_or_name)
@@ -24,8 +29,8 @@ KeyMap_create(KeyMap_c* self, char* input_dev_or_name)
     }
     struct uinput_setup usetup = { 0 };
     usetup.id.bustype = BUS_USB;
-    usetup.id.vendor = 0x1234;  /* sample vendor */
-    usetup.id.product = 0x5678; /* sample product */
+    usetup.id.vendor = 0x1234; /* sample vendor */
+    usetup.id.product = 0x0001;
     e$ret(str.copy(usetup.name, "UberKeyboardMappper", sizeof(usetup.name)));
 
     e$except_errno (ioctl(self->output.fd, UI_DEV_SETUP, &usetup)) { goto err; }
@@ -33,7 +38,7 @@ KeyMap_create(KeyMap_c* self, char* input_dev_or_name)
 
     // Attaching for input keyboard
     if (str.starts_with(input_dev_or_name, "/dev/")) {
-        e$except_errno (self->input.fd = open(input_dev_or_name, O_RDONLY)) {
+        e$except_errno (self->input.fd = open(input_dev_or_name, O_RDONLY | O_NONBLOCK)) {
             log$error("Error opening: %s\n", input_dev_or_name);
             goto err;
         }
@@ -65,6 +70,70 @@ KeyMap_create(KeyMap_c* self, char* input_dev_or_name)
 
     e$except_errno (libevdev_grab(self->input.dev, LIBEVDEV_GRAB)) { goto err; }
 
+    // Making mouse
+    if (self->mouse_key_code) {
+        struct libevdev* dev = NULL;
+
+        // Create a new evdev device
+        e$except_null (dev = libevdev_new()) { goto err; }
+
+        // Set device properties
+        libevdev_set_name(dev, "UberKeyboardMappperVirtualMouse");
+        libevdev_set_id_vendor(dev, 0x1234);
+        libevdev_set_id_product(dev, 0x0002);
+        libevdev_set_id_bustype(dev, BUS_USB);
+        libevdev_set_id_version(dev, 1);
+
+        // Enable relative axes (mouse movement)
+        libevdev_enable_event_type(dev, EV_REL);
+        libevdev_enable_event_code(dev, EV_REL, REL_X, NULL);
+        libevdev_enable_event_code(dev, EV_REL, REL_Y, NULL);
+        libevdev_enable_event_code(dev, EV_REL, REL_WHEEL, NULL);
+        libevdev_enable_event_code(dev, EV_REL, REL_HWHEEL, NULL);
+
+        // Enable buttons
+        libevdev_enable_event_type(dev, EV_KEY);
+        libevdev_enable_event_code(dev, EV_KEY, BTN_LEFT, NULL);
+        libevdev_enable_event_code(dev, EV_KEY, BTN_RIGHT, NULL);
+        libevdev_enable_event_code(dev, EV_KEY, BTN_MIDDLE, NULL);
+
+        // Enable synchronization events
+        libevdev_enable_event_type(dev, EV_SYN);
+
+        // Create uinput device
+        e$except_errno (
+            libevdev_uinput_create_from_device(dev, LIBEVDEV_UINPUT_OPEN_MANAGED, &self->mouse.dev)
+        ) {
+            goto err;
+        }
+
+        printf(
+            "Virtual mouse created successfully Device: %s\n",
+            libevdev_uinput_get_devnode(self->mouse.dev)
+        );
+
+        if (self->mouse_sensitivity <= 0) {
+            self->mouse_sensitivity = 1.0f;
+        } else {
+            uassertf(
+                self->mouse_sensitivity < 10 && self->mouse_sensitivity > 0.1,
+                "sensitivity expected in (0.1;10) got: %0.3f",
+                self->mouse_sensitivity
+            );
+        }
+        if (self->mouse_sensitivity_precise <= 0) {
+            self->mouse_sensitivity_precise = 1.0f;
+        } else {
+            uassertf(
+                self->mouse_sensitivity_precise < 10 && self->mouse_sensitivity_precise > 0.1,
+                "mouse_sensitivity_precise expected in (0.1;10) got: %0.3f",
+                self->mouse_sensitivity_precise
+            );
+        }
+
+        libevdev_free(dev);
+    }
+
     return EOK;
 
 err:
@@ -80,7 +149,7 @@ KeyMap_find_mapped_keyboard(KeyMap_c* self, char* keyboard_name)
     {
         io.printf("Looking for keyboard: '%s'\n", keyboard_name);
         for$each (it, os.fs.find("/dev/input/event*", false, _)) {
-            e$except_errno (self->input.fd = open(it, O_RDONLY)) {
+            e$except_errno (self->input.fd = open(it, O_RDONLY | O_NONBLOCK)) {
                 log$error("Error opening: %s\n", it);
                 goto err;
             }
@@ -181,6 +250,113 @@ print_event(struct input_event* ev)
 }
 
 Exception
+KeyMap_mouse_movement(KeyMap_c* self, int rel_x, int rel_y)
+{
+    uassert(self->mouse.dev);
+
+    if (rel_x) {
+        e$except_errno (libevdev_uinput_write_event(self->mouse.dev, EV_REL, REL_X, rel_x)) {
+            goto err;
+        }
+    }
+    if (rel_y) {
+        e$except_errno (libevdev_uinput_write_event(self->mouse.dev, EV_REL, REL_Y, rel_y)) {
+            goto err;
+        }
+    }
+    e$except_errno (libevdev_uinput_write_event(self->mouse.dev, EV_SYN, SYN_REPORT, 0)) {
+        goto err;
+    }
+    return EOK;
+
+err:
+    return Error.io;
+}
+
+Exception
+KeyMap_mouse_click(KeyMap_c* self, int button, int pressed)
+{
+    uassert(self->mouse.dev);
+    struct input_event ev = { 0 };
+
+    // Virtually unpress mouse mod key
+    ev.type = EV_MSC;
+    ev.code = MSC_SCAN;
+    ev.value = 0;
+    e$except_errno (write(self->output.fd, &ev, sizeof(ev))) { return Error.io; }
+
+    ev.type = EV_KEY;
+    ev.code = self->mouse_key_code;
+    ev.value = 0;
+    e$except_errno (write(self->output.fd, &ev, sizeof(ev))) { return Error.io; }
+
+    ev.type = EV_SYN;
+    ev.code = SYN_REPORT;
+    ev.value = 0;
+    e$except_errno (write(self->output.fd, &ev, sizeof(ev))) { return Error.io; }
+
+    // Send button event
+    e$except_errno (libevdev_uinput_write_event(self->mouse.dev, EV_KEY, button, pressed)) {
+        goto err;
+    }
+
+    // Send synchronization event
+    e$except_errno (libevdev_uinput_write_event(self->mouse.dev, EV_SYN, SYN_REPORT, 0)) {
+        goto err;
+    }
+    usleep(20000);
+
+    // Virtually press mouse mod key
+    ev.type = EV_MSC;
+    ev.code = MSC_SCAN;
+    ev.value = 0;
+    e$except_errno (write(self->output.fd, &ev, sizeof(ev))) { return Error.io; }
+
+    ev.type = EV_KEY;
+    ev.code = self->mouse_key_code;
+    ev.value = 1;
+    e$except_errno (write(self->output.fd, &ev, sizeof(ev))) { return Error.io; }
+
+    ev.type = EV_SYN;
+    ev.code = SYN_REPORT;
+    ev.value = 0;
+    e$except_errno (write(self->output.fd, &ev, sizeof(ev))) { return Error.io; }
+
+    ev.type = EV_KEY;
+    ev.code = self->mouse_key_code;
+    ev.value = 2;
+    e$except_errno (write(self->output.fd, &ev, sizeof(ev))) { return Error.io; }
+
+    ev.type = EV_SYN;
+    ev.code = SYN_REPORT;
+    ev.value = 0;
+    e$except_errno (write(self->output.fd, &ev, sizeof(ev))) { return Error.io; }
+
+    if (self->debug) { printf("Button %d %s\n", button, pressed ? "pressed" : "released"); }
+    return EOK;
+err:
+    return Error.io;
+}
+
+Exception
+KeyMap_mouse_wheel(KeyMap_c* self, int vertical)
+{
+    uassert(self->mouse.dev);
+
+    if (vertical != 0) {
+        e$except_errno (libevdev_uinput_write_event(self->mouse.dev, EV_REL, REL_WHEEL, vertical)) {
+            goto err;
+        }
+        e$except_errno (libevdev_uinput_write_event(self->mouse.dev, EV_SYN, SYN_REPORT, 0)) {
+            goto err;
+        }
+    }
+    return EOK;
+err:
+    return Error.io;
+}
+
+Exception
 KeyMap_handle_key(KeyMap_c* self, struct input_event* ev)
 {
     uassert(ev->type == EV_KEY || ev->type == EV_MSC || ev->type == EV_SYN);
@@ -188,6 +364,16 @@ KeyMap_handle_key(KeyMap_c* self, struct input_event* ev)
     if (self->debug) { print_event(ev); }
 
     if (ev->code < KEY_MAX) {
+        if (self->mouse_key_code && ev->code == self->mouse_key_code) {
+            self->mouse_pressed = ev->value > 0;
+            if (!self->mouse_pressed) {
+                self->mouse.left = false;
+                self->mouse.right = false;
+                self->mouse.up = false;
+                self->mouse.down = false;
+            }
+        }
+
         if (self->mod_key_code && ev->code == self->mod_key_code) {
             // Special case (bug) when MOD key released before arrow key,
             //   it was leading to infinite key loop
@@ -210,17 +396,44 @@ KeyMap_handle_key(KeyMap_c* self, struct input_event* ev)
             self->mod_pressed = ev->value > 0;
             self->last_key_mod = 0;
         } else {
+            if (ev->type == EV_KEY && ev->value == 2) { self->last_key_mod = ev->code; }
+
             if (self->mod_pressed) {
                 if (self->mod_map[ev->code]) {
                     ev->code = self->mod_map[ev->code];
-                    if (ev->value == 2) {
-                        self->last_key_mod = ev->code;
-                    }
                     e$except_errno (write(self->output.fd, ev, sizeof(*ev))) { return Error.io; }
 
                     ev->type = EV_SYN;
                     ev->code = SYN_REPORT;
                     ev->value = 0;
+                    e$except_errno (write(self->output.fd, ev, sizeof(*ev))) { return Error.io; }
+                }
+            } else if (self->mouse_pressed) {
+                if (self->mouse_map[ev->code]) {
+                    switch (self->mouse_map[ev->code]) {
+                        case BTN_LEFT:
+                            e$ret(KeyMap.mouse_click(self, BTN_LEFT, ev->value));
+                            break;
+                        case BTN_RIGHT:
+                            e$ret(KeyMap.mouse_click(self, BTN_RIGHT, ev->value));
+                            break;
+                        // NOTE: movements are handled in KeyMap_handle_events
+                        case KEY_RIGHT:
+                            self->mouse.right = ev->value;
+                            break;
+                        case KEY_LEFT:
+                            self->mouse.left = ev->value;
+                            break;
+                        case KEY_UP:
+                            self->mouse.up = ev->value;
+                            break;
+                        case KEY_DOWN:
+                            self->mouse.down = ev->value;
+                            break;
+                        default:
+                            unreachable("Unsupported mouse btn or event");
+                    }
+                } else {
                     e$except_errno (write(self->output.fd, ev, sizeof(*ev))) { return Error.io; }
                 }
             } else {
@@ -237,26 +450,100 @@ KeyMap_handle_key(KeyMap_c* self, struct input_event* ev)
 }
 
 Exception
+KeyMap_handle_mouse_move(KeyMap_c* self)
+{
+    // Initial direction
+    int x = 0;
+    int y = 0;
+
+    // mouse.up/down/left/right - 1 when single press, 2 when hold (i.e. faster move)
+    if (self->mouse.up) {
+        y = -10;
+        if (self->mouse.up > 1) {
+            y *= self->mouse_sensitivity;
+        } else {
+            y *= self->mouse_sensitivity_precise;
+        }
+    }
+    if (self->mouse.down) {
+        y = 10;
+        if (self->mouse.down > 1) {
+            y *= self->mouse_sensitivity;
+        } else {
+            y *= self->mouse_sensitivity_precise;
+        }
+    }
+    if (self->mouse.left) {
+        x = -10;
+        if (self->mouse.left > 1) {
+            x *= self->mouse_sensitivity;
+        } else {
+            x *= self->mouse_sensitivity_precise;
+        }
+    }
+    if (self->mouse.right) {
+        x = 10;
+        if (self->mouse.right > 1) {
+            x *= self->mouse_sensitivity;
+        } else {
+            x *= self->mouse_sensitivity_precise;
+        }
+    }
+
+    if (x != 0 || y != 0) {
+        if (self->debug) { printf("Mouse move x=%d y=%d\n", x, y); }
+        e$ret(KeyMap.mouse_movement(self, x, y));
+    }
+
+    return EOK;
+}
+
+Exception
 KeyMap_handle_events(KeyMap_c* self)
 {
     int rc = 0;
+    int poll_rc = 1;
+    struct pollfd poll_input_fd = { self->input.fd, POLLIN, 0 };
+
     do {
         struct input_event ev;
-        rc = libevdev_next_event(
-            self->input.dev,
-            LIBEVDEV_READ_FLAG_NORMAL | LIBEVDEV_READ_FLAG_BLOCKING,
-            &ev
-        );
-        if (rc == LIBEVDEV_READ_STATUS_SYNC) {
-            printf("::::::::::::::::::::: dropped ::::::::::::::::::::::\n");
-            while (rc == LIBEVDEV_READ_STATUS_SYNC) {
-                rc = libevdev_next_event(self->input.dev, LIBEVDEV_READ_FLAG_SYNC, &ev);
+        // Peek event que or file descriptor
+        e$except_errno (poll_rc = libevdev_has_event_pending(self->input.dev)) { return Error.io; };
+
+        if (poll_rc == 0) {
+            // No events in current que, blocking wait with timeout for mouse
+            e$except_errno (
+                poll_rc = poll(&poll_input_fd, 1, (self->mouse_pressed) ? 10 : -1 /*timeout*/)
+            ) {
+                return Error.io;
             }
-            printf("::::::::::::::::::::: re-synced ::::::::::::::::::::::\n");
         }
 
-        // Do magic remapping here
-        if (rc == LIBEVDEV_READ_STATUS_SUCCESS) { e$ret(KeyMap_handle_key(self, &ev)); }
+        if (poll_rc > 0) {
+            rc = libevdev_next_event(
+                self->input.dev,
+                LIBEVDEV_READ_FLAG_NORMAL | LIBEVDEV_READ_FLAG_BLOCKING,
+                &ev
+            );
+            if (rc == LIBEVDEV_READ_STATUS_SYNC) {
+                printf("::::::::::::::::::::: dropped ::::::::::::::::::::::\n");
+                while (rc == LIBEVDEV_READ_STATUS_SYNC) {
+                    rc = libevdev_next_event(self->input.dev, LIBEVDEV_READ_FLAG_SYNC, &ev);
+                }
+                printf("::::::::::::::::::::: re-synced ::::::::::::::::::::::\n");
+            }
+
+            // Do magic remapping here
+            if (rc == LIBEVDEV_READ_STATUS_SUCCESS) { e$ret(KeyMap_handle_key(self, &ev)); }
+            // printf("poll_rc = %d, rc = %d\n", poll_rc, rc);
+        }
+
+
+        if (self->mouse_pressed && (poll_rc == 0 /*timeout*/ ||
+                                    (rc == LIBEVDEV_READ_STATUS_SUCCESS && ev.type == EV_KEY))) {
+            e$ret(KeyMap_handle_mouse_move(self));
+        }
+
 
     } while (rc == LIBEVDEV_READ_STATUS_SYNC || rc == LIBEVDEV_READ_STATUS_SUCCESS ||
              rc == -EAGAIN);
@@ -284,6 +571,7 @@ KeyMap_destroy(KeyMap_c* self)
         close(self->output.fd);
         self->output.fd = -1;
     }
+    if (self->mouse.dev) { libevdev_uinput_destroy(self->mouse.dev); }
     memset(self, 0, sizeof(*self));
 }
 
@@ -296,7 +584,11 @@ const struct __cex_namespace__KeyMap KeyMap = {
     .find_mapped_keyboard = KeyMap_find_mapped_keyboard,
     .handle_events = KeyMap_handle_events,
     .handle_key = KeyMap_handle_key,
+    .handle_mouse_move = KeyMap_handle_mouse_move,
     .is_qwerty_keyboard = KeyMap_is_qwerty_keyboard,
+    .mouse_click = KeyMap_mouse_click,
+    .mouse_movement = KeyMap_mouse_movement,
+    .mouse_wheel = KeyMap_mouse_wheel,
 
     // clang-format on
 };

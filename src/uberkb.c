@@ -23,11 +23,30 @@ main(int argc, char** argv)
         log$info("Using special settings for UHK\n");
         // CUT/COPY/PASTE for UHK
         keymap = (KeyMap_c)  {
-            // .debug = true,
+            .debug = true,
             .direct_map = {
                 [KEY_F13] = KEY_CUT,
                 [KEY_F14] = KEY_COPY,
                 [KEY_F15] = KEY_PASTE,
+            },
+            .mouse_key_code = KEY_LEFTMETA,
+            .mouse_sensitivity = 1.0,
+            .mouse_sensitivity_precise = 0.2,
+            .mouse_map = {
+                [KEY_SPACE] = BTN_LEFT,
+                [KEY_J] = KEY_LEFT,
+                [KEY_L] = KEY_RIGHT,
+                [KEY_I] = KEY_UP,
+                [KEY_K] = KEY_DOWN,
+            },
+
+            // For testing only
+            .mod_key_code = KEY_LEFTALT,
+            .mod_map = {
+                [KEY_I] = KEY_UP, 
+                [KEY_K] = KEY_DOWN, 
+                [KEY_J] = KEY_LEFT, 
+                [KEY_L] = KEY_RIGHT, 
             },
         };
     } else {
