@@ -31,13 +31,16 @@ main(int argc, char** argv)
             },
             .mouse_key_code = KEY_LEFTMETA,
             .mouse_sensitivity = 1.0,
-            .mouse_speedup_ms = 300,
+            .mouse_speedup_ms = 500,
             .mouse_map = {
                 [KEY_SPACE] = BTN_LEFT,
+                [KEY_N] = BTN_RIGHT,
                 [KEY_J] = KEY_LEFT,
                 [KEY_L] = KEY_RIGHT,
                 [KEY_I] = KEY_UP,
                 [KEY_K] = KEY_DOWN,
+                [KEY_Y] = BTN_GEAR_UP,
+                [KEY_H] = BTN_GEAR_DOWN,
             },
 
             // For testing only

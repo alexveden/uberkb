@@ -428,6 +428,12 @@ KeyMap_handle_key(KeyMap_c* self, struct input_event* ev)
                         case BTN_RIGHT:
                             e$ret(KeyMap.mouse_click(self, BTN_RIGHT, ev->value));
                             break;
+                        case BTN_GEAR_UP:
+                            e$ret(KeyMap.mouse_wheel(self, 1));
+                            break;
+                        case BTN_GEAR_DOWN:
+                            e$ret(KeyMap.mouse_wheel(self, -1));
+                            break;
                         // NOTE: movements are handled in KeyMap_handle_events
                         case KEY_RIGHT:
                             self->mouse.right = ev->value > 0;
