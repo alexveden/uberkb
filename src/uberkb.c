@@ -23,7 +23,7 @@ main(int argc, char** argv)
         log$info("Using special settings for UHK\n");
         // CUT/COPY/PASTE for UHK
         keymap = (KeyMap_c)  {
-            .debug = true,
+            // .debug = true,
             .direct_map = {
                 [KEY_F13] = KEY_CUT,
                 [KEY_F14] = KEY_COPY,
@@ -31,7 +31,7 @@ main(int argc, char** argv)
             },
             .mouse_key_code = KEY_LEFTMETA,
             .mouse_sensitivity = 1.0,
-            .mouse_speedup_ms = 500,
+            .mouse_speedup_ms = 400,
             .mouse_map = {
                 // Buttons
                 [KEY_SPACE] = BTN_LEFT,
@@ -46,14 +46,14 @@ main(int argc, char** argv)
                 [KEY_K] = KEY_DOWN,
             },
 
-            // For testing only
-            .mod_key_code = KEY_LEFTALT,
-            .mod_map = {
-                [KEY_I] = KEY_UP, 
-                [KEY_K] = KEY_DOWN, 
-                [KEY_J] = KEY_LEFT, 
-                [KEY_L] = KEY_RIGHT, 
-            },
+            // // For testing only
+            // .mod_key_code = KEY_LEFTALT,
+            // .mod_map = {
+            //     [KEY_I] = KEY_UP, 
+            //     [KEY_K] = KEY_DOWN, 
+            //     [KEY_J] = KEY_LEFT, 
+            //     [KEY_L] = KEY_RIGHT, 
+            // },
         };
     } else {
         // Default mapping all other generic keyboards
@@ -88,7 +88,23 @@ main(int argc, char** argv)
             },
             .direct_map = {
                 [KEY_CAPSLOCK] = KEY_ESC, 
-            }
+            },
+            .mouse_key_code = KEY_LEFTMETA,
+            .mouse_sensitivity = 1.0,
+            .mouse_speedup_ms = 400,
+            .mouse_map = {
+                // Buttons
+                [KEY_SPACE] = BTN_LEFT,
+                [KEY_N] = BTN_RIGHT,
+                // Wheel
+                [KEY_Y] = BTN_GEAR_UP,
+                [KEY_H] = BTN_GEAR_DOWN,
+                // Cursor
+                [KEY_J] = KEY_LEFT,
+                [KEY_L] = KEY_RIGHT,
+                [KEY_I] = KEY_UP,
+                [KEY_K] = KEY_DOWN,
+            },
         };
     }
 
