@@ -386,9 +386,22 @@ KeyMap_handle_key(KeyMap_c* self, struct input_event* ev)
         }
 
         if (self->mod_key_code && ev->code == self->mod_key_code) {
-            // Special case (bug) when MOD key released before arrow key,
-            //   it was leading to infinite key loop
-            if (self->mod_pressed && ev->value == 0 && self->last_key_mod) {
+            self->mod_pressed = ev->value > 0;
+
+            if (!self->mod_pressed && self->last_key_mod) {
+                // Special case (bug) when MOD key released before arrow key,
+                //   it was leading to infinite key loop
+                if (self->debug) {
+                    printf(
+                        "Unpress last mapped key: %s\n",
+                        libevdev_event_code_get_name(EV_KEY, self->last_key_mod)
+                    );
+                }
+                ev->type = EV_SYN;
+                ev->code = SYN_REPORT;
+                ev->value = 0;
+                e$except_errno (write(self->output.fd, ev, sizeof(*ev))) { return Error.io; }
+
                 ev->type = EV_MSC;
                 ev->code = MSC_SCAN;
                 ev->value = self->last_key_mod;
@@ -399,19 +412,17 @@ KeyMap_handle_key(KeyMap_c* self, struct input_event* ev)
                 ev->value = 0;
                 e$except_errno (write(self->output.fd, ev, sizeof(*ev))) { return Error.io; }
 
-                ev->type = EV_SYN;
-                ev->code = SYN_REPORT;
-                ev->value = 0;
-                e$except_errno (write(self->output.fd, ev, sizeof(*ev))) { return Error.io; }
+                self->last_key_mod = 0;
             }
-            self->mod_pressed = ev->value > 0;
-            self->last_key_mod = 0;
         } else {
-            if (ev->type == EV_KEY && ev->value == 2) { self->last_key_mod = ev->code; }
-
             if (self->mod_pressed) {
                 if (self->mod_map[ev->code]) {
                     ev->code = self->mod_map[ev->code];
+
+                    if (ev->type == EV_KEY && ev->value == 2) {
+                        // NOTE: to be unpressed when mod released before key (using mod code!)
+                        self->last_key_mod = ev->code;
+                    }
                     e$except_errno (write(self->output.fd, ev, sizeof(*ev))) { return Error.io; }
 
                     ev->type = EV_SYN;
