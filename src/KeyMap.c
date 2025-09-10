@@ -251,7 +251,7 @@ get_monotonic_time_ms()
     struct timespec ts;
 
     if (clock_gettime(CLOCK_MONOTONIC, &ts) == -1) {
-        unreachable("clock_gettime CLOCK_MONOTONIC failed");
+        unreachable();
         return 0;
     }
 
@@ -459,7 +459,7 @@ KeyMap_handle_key(KeyMap_c* self, struct input_event* ev)
                             self->mouse.down = ev->value > 0;
                             break;
                         default:
-                            unreachable("Unsupported mouse btn or event");
+                            unreachable();
                     }
                 } else {
                     e$except_errno (write(self->output.fd, ev, sizeof(*ev))) { return Error.io; }

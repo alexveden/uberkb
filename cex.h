@@ -94,6 +94,7 @@ Use `cex -D config` to reset all project config flags to defaults
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <assert.h>
 
 
 #if defined(__APPLE__) || defined(__MACH__)
@@ -108,9 +109,9 @@ Use `cex -D config` to reset all project config flags to defaults
 #endif
 
 #define cex$version_major 0
-#define cex$version_minor 14
+#define cex$version_minor 16
 #define cex$version_patch 0
-#define cex$version_date "2025-08-02"
+#define cex$version_date "2025-09-09"
 
 
 
@@ -138,8 +139,10 @@ typedef double f64;
 typedef size_t usize;
 typedef ptrdiff_t isize;
 
-/// automatic variable type, supported by GCC/Clang
-#define var __auto_type
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ < 202311L
+/// automatic variable type, supported by GCC/Clang or C23
+#    define auto __auto_type
+#endif
 
 /*
  *                 BRANCH MANAGEMENT
@@ -162,6 +165,104 @@ typedef ptrdiff_t isize;
 /*
  *                 ERRORS
  */
+
+/**
+CEX Error handling cheat sheet:
+
+1. Errors can be any `char*`, or string literals.
+2. EOK / Error.ok - is NULL, means no error
+3. Exception return type forced to be checked by compiler
+4. Error is built-in generic error type
+5. Errors should be checked by pointer comparison, not string contents.
+6. `e$` are helper macros for error handling
+7.  DO NOT USE break/continue inside e\$except/e\$except_* scopes (these macros are for loops too)!
+
+
+Generic errors:
+
+```c
+Error.ok = EOK;                       // Success
+Error.memory = "MemoryError";         // memory allocation error
+Error.io = "IOError";                 // IO error
+Error.overflow = "OverflowError";     // buffer overflow
+Error.argument = "ArgumentError";     // function argument error
+Error.integrity = "IntegrityError";   // data integrity error
+Error.exists = "ExistsError";         // entity or key already exists
+Error.not_found = "NotFoundError";    // entity or key already exists
+Error.skip = "ShouldBeSkipped";       // NOT an error, function result must be skipped
+Error.empty = "EmptyError";           // resource is empty
+Error.eof = "EOF";                    // end of file reached
+Error.argsparse = "ProgramArgsError"; // program arguments empty or incorrect
+Error.runtime = "RuntimeError";       // generic runtime error
+Error.assert = "AssertError";         // generic runtime check
+Error.os = "OSError";                 // generic OS check
+Error.timeout = "TimeoutError";       // await interval timeout
+Error.permission = "PermissionError"; // Permission denied
+Error.try_again = "TryAgainError";    // EAGAIN / EWOULDBLOCK errno analog for async operations
+```
+
+```c
+
+Exception
+remove_file(char* path)
+{
+    if (path == NULL || path[0] == '\0') { 
+        return Error.argument;  // Empty of null file
+    }
+    if (!os.path.exists(path)) {
+        return "Not exists" // literal error are allowed, but must be handled as strcmp()
+    }
+    if (str.eq(path, "magic.file")) {
+        // Returns an Error.integrity and logs error at current line to stdout
+        return e$raise(Error.integrity, "Removing magic file is not allowed!");
+    }
+    if (remove(path) < 0) { 
+        return strerror(errno); // using system error text (arbitrary!)
+    }
+    return EOK;
+}
+
+Exception read_file(char* filename) {
+    e$assert(buff != NULL);
+
+    int fd = 0;
+    e$except_errno(fd = open(filename, O_RDONLY)) { return Error.os; }
+    return EOK;
+}
+
+Exception do_stuff(char* filename) {
+    // return immediately with error + prints traceback
+    e$ret(read_file("foo.txt"));
+
+    // jumps to label if read_file() fails + prints traceback
+    e$goto(read_file(NULL), fail);
+
+    // silent error handing without tracebacks
+    e$except_silent (err, foo(0)) {
+
+        // Nesting of error handlers is allowed
+        e$except_silent (err, foo(2)) {
+            return err;
+        }
+
+        // NOTE: `err` is address of char* compared with address Error.os (not by string contents!)
+        if (err == Error.os) {
+            // Special handing
+            io.print("Ooops OS problem\n");
+        } else {
+            // propagate
+            return err;
+        }
+    }
+    return EOK;
+
+fail:
+    // TODO: cleanup here
+    return Error.io;
+}
+```
+*/
+#define __e$
 
 /// Generic CEX error is a char*, where NULL means success(no error)
 typedef char* Exc;
@@ -220,11 +321,30 @@ __cex__fprintf_dummy(void)
 #endif
 
 #ifndef _WIN32
-#define CEX_NAMESPACE __attribute__((visibility("hidden"))) extern const
+#    define CEX_NAMESPACE __attribute__((visibility("hidden"))) extern const
 #else
-#define CEX_NAMESPACE extern const
+#    define CEX_NAMESPACE extern const
 #endif
 
+/**
+Simple console logging engine:
+
+- Prints file:line + log type: `[INFO]    ( file.c:14 cexy_fun() ) Message format: ./cex`
+- Supports CEX formatting engine
+- Can be regulated using compile time level, e.g. `#define CEX_LOG_LVL 4`
+
+
+Log levels (CEX_LOG_LVL value):
+
+- 0 - mute all including assert messages, tracebacks, errors
+- 1 - allow log$error + assert messages, tracebacks
+- 2 - allow log$warn
+- 3 - allow log$info
+- 4 - allow log$debug (default level if CEX_LOG_LVL is not set)
+- 5 - allow log$trace
+
+*/
+#define __log$
 
 #ifndef CEX_LOG_LVL
 // LVL Value
@@ -232,13 +352,14 @@ __cex__fprintf_dummy(void)
 // 1 - allow log$error + assert messages, tracebacks
 // 2 - allow log$warn
 // 3 - allow log$info
-// 4 - allow log$debug
+// 4 - allow log$debug  (default level if CEX_LOG_LVL is not set)
 // 5 - allow log$trace
 // NOTE: you may override this level to manage log$* verbosity
 #    define CEX_LOG_LVL 4
 #endif
 
 #if CEX_LOG_LVL > 0
+/// Log error (when CEX_LOG_LVL > 0)
 #    define log$error(format, ...)                                                                 \
         (__cex__fprintf(                                                                           \
             stdout,                                                                                \
@@ -254,6 +375,7 @@ __cex__fprintf_dummy(void)
 #endif
 
 #if CEX_LOG_LVL > 1
+/// Log warning  (when CEX_LOG_LVL > 1)
 #    define log$warn(format, ...)                                                                  \
         (__cex__fprintf(                                                                           \
             stdout,                                                                                \
@@ -269,6 +391,7 @@ __cex__fprintf_dummy(void)
 #endif
 
 #if CEX_LOG_LVL > 2
+/// Log info  (when CEX_LOG_LVL > 2)
 #    define log$info(format, ...)                                                                  \
         (__cex__fprintf(                                                                           \
             stdout,                                                                                \
@@ -284,6 +407,7 @@ __cex__fprintf_dummy(void)
 #endif
 
 #if CEX_LOG_LVL > 3
+/// Log debug (when CEX_LOG_LVL > 3)
 #    define log$debug(format, ...)                                                                 \
         (__cex__fprintf(                                                                           \
             stdout,                                                                                \
@@ -299,6 +423,7 @@ __cex__fprintf_dummy(void)
 #endif
 
 #if CEX_LOG_LVL > 4
+/// Log tace (when CEX_LOG_LVL > 4)
 #    define log$trace(format, ...)                                                                 \
         (__cex__fprintf(                                                                           \
             stdout,                                                                                \
@@ -326,9 +451,7 @@ __cex__fprintf_dummy(void)
             fail_func                                                                              \
         ))
 
-/**
- * @brief Non disposable assert, returns Error.assert CEX exception when failed
- */
+/// Non disposable assert, returns Error.assert CEX exception when failed
 #    define e$assert(A)                                                                             \
         ({                                                                                          \
             if (unlikely(!((A)))) {                                                                 \
@@ -338,6 +461,7 @@ __cex__fprintf_dummy(void)
         })
 
 
+/// Non disposable assert, returns Error.assert CEX exception when failed (supports formatting)
 #    define e$assertf(A, format, ...)                                                              \
         ({                                                                                         \
             if (unlikely(!((A)))) {                                                                \
@@ -374,6 +498,7 @@ __cex__fprintf_dummy(void)
 #ifndef mem$asan_enabled
 #    if defined(__has_feature)
 #        if __has_feature(address_sanitizer)
+/// true - if program was compiled with address sanitizer support
 #            define mem$asan_enabled() 1
 #        else
 #            define mem$asan_enabled() 0
@@ -411,7 +536,7 @@ int __cex_test_uassert_enabled = 1;
 #        define uassert_is_enabled() (__cex_test_uassert_enabled)
 #    else
 #        define uassert_disable()                                                                  \
-            _Static_assert(false, "uassert_disable() allowed only when compiled with -DCEX_TEST")
+            static_assert(false, "uassert_disable() allowed only when compiled with -DCEX_TEST")
 #        define uassert_enable() (void)0
 #        define uassert_is_enabled() true
 #        define __cex_test_postmortem_ctx NULL
@@ -437,8 +562,8 @@ int __cex_test_uassert_enabled = 1;
                     #A                                                                             \
                 );                                                                                 \
                 if (uassert_is_enabled()) {                                                        \
-                    sanitizer_stack_trace();\
-                    __builtin_trap();                                                       \
+                    sanitizer_stack_trace();                                                       \
+                    __builtin_trap();                                                              \
                 }                                                                                  \
             }                                                                                      \
         })
@@ -456,8 +581,8 @@ int __cex_test_uassert_enabled = 1;
                     ##__VA_ARGS__                                                                  \
                 );                                                                                 \
                 if (uassert_is_enabled()) {                                                        \
-                    sanitizer_stack_trace();\
-                    __builtin_trap();                                                       \
+                    sanitizer_stack_trace();                                                       \
+                    __builtin_trap();                                                              \
                 }                                                                                  \
             }                                                                                      \
         })
@@ -465,20 +590,20 @@ int __cex_test_uassert_enabled = 1;
 
 __attribute__((noinline)) void __cex__panic(void);
 
-#define unreachable(format, ...)                                                                   \
-    ({                                                                                             \
-        __cex__fprintf(                                                                            \
-            stderr,                                                                                \
-            "[UNREACHABLE] ",                                                                      \
-            __FILE_NAME__,                                                                         \
-            __LINE__,                                                                              \
-            __func__,                                                                              \
-            format "\n",                                                                           \
-            ##__VA_ARGS__                                                                          \
-        );                                                                                         \
-        __cex__panic();                                                                            \
-        __builtin_unreachable();                                                                   \
-    })
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L
+#    undef unreachable
+#endif
+
+#ifdef NDEBUG
+#    define unreachable() __builtin_unreachable()
+#else
+#    define unreachable()                                                                          \
+        ({                                                                                         \
+            __cex__fprintf(stderr, "[UNREACHABLE] ", __FILE_NAME__, __LINE__, __func__, "\n");     \
+            __cex__panic();                                                                        \
+            __builtin_unreachable();                                                               \
+        })
+#endif
 
 #if defined(_WIN32) || defined(_WIN64)
 #    define breakpoint() __debugbreak()
@@ -499,10 +624,11 @@ __attribute__((noinline)) void __cex__panic(void);
 #define cex$varname(a, b) cex$concat3(__cex__, a, b)
 #define cex$tmpname(base) cex$varname(base, __LINE__)
 
+/// raises an error, code: `return e$raise(Error.integrity, "ooops: %d", i);`
 #define e$raise(return_uerr, error_msg, ...)                                                       \
     (log$error("[%s] " error_msg "\n", return_uerr, ##__VA_ARGS__), (return_uerr))
 
-// WARNING: DO NOT USE break/continue inside e$except/e$except_silent {scope!}
+/// catches the error of function inside scope + prints traceback
 #define e$except(_var_name, _func)                                                                 \
     for (Exc _var_name = _func;                                                                    \
          unlikely((_var_name != EOK) && (__cex__traceback(_var_name, #_func), 1));                 \
@@ -511,13 +637,15 @@ __attribute__((noinline)) void __cex__panic(void);
 #if defined(CEX_TEST) || defined(CEX_BUILD)
 #    define e$except_silent(_var_name, _func) e$except (_var_name, _func)
 #else
+/// catches the error of function inside scope (without traceback)
 #    define e$except_silent(_var_name, _func)                                                      \
         for (Exc _var_name = _func; unlikely(_var_name != EOK); _var_name = EOK)
 #endif
 
+/// catches the error of system function (if negative value + errno), prints errno error
 #define e$except_errno(_expression)                                                                \
     for (int _tmp_errno = 0; unlikely(                                                             \
-             ((_tmp_errno == 0) && ((_expression) < 0) && ((_tmp_errno = errno), 1) &&           \
+             ((_tmp_errno == 0) && ((_expression) < 0) && ((_tmp_errno = errno), 1) &&             \
               (log$error(                                                                          \
                    "`%s` failed errno: %d, msg: %s\n",                                             \
                    #_expression,                                                                   \
@@ -529,12 +657,15 @@ __attribute__((noinline)) void __cex__panic(void);
          );                                                                                        \
          _tmp_errno = 1)
 
+/// catches the error is expression returned null
 #define e$except_null(_expression)                                                                 \
     if (unlikely(((_expression) == NULL) && (log$error("`%s` returned NULL\n", #_expression), 1)))
 
+/// catches the error is expression returned true
 #define e$except_true(_expression)                                                                 \
     if (unlikely(((_expression)) && (log$error("`%s` returned non zero\n", #_expression), 1)))
 
+/// immediately returns from function with _func error + prints traceback 
 #define e$ret(_func)                                                                               \
     for (Exc cex$tmpname(__cex_err_traceback_) = _func; unlikely(                                  \
              (cex$tmpname(__cex_err_traceback_) != EOK) &&                                         \
@@ -543,6 +674,7 @@ __attribute__((noinline)) void __cex__panic(void);
          cex$tmpname(__cex_err_traceback_) = EOK)                                                  \
     return cex$tmpname(__cex_err_traceback_)
 
+/// `goto _label` when _func returned error + prints traceback
 #define e$goto(_func, _label)                                                                      \
     for (Exc cex$tmpname(__cex_err_traceback_) = _func; unlikely(                                  \
              (cex$tmpname(__cex_err_traceback_) != EOK) &&                                         \
@@ -552,119 +684,6 @@ __attribute__((noinline)) void __cex__panic(void);
     goto _label
 
 
-/*
- *                  ARRAYS / SLICES / ITERATORS INTERFACE
- */
-#define slice$define(eltype)                                                                       \
-    struct                                                                                         \
-    {                                                                                              \
-        typeof(eltype)* arr;                                                                       \
-        usize len;                                                                                 \
-    }
-
-struct _cex_arr_slice
-{
-    isize start;
-    isize end;
-    isize __placeholder;
-};
-
-#define _arr$slice_get(slice, array, array_len, ...)                                               \
-    {                                                                                              \
-        struct _cex_arr_slice _slice = { __VA_ARGS__, .__placeholder = 0 };                        \
-        isize _len = array_len;                                                                    \
-        if (unlikely(_slice.start < 0)) _slice.start += _len;                                      \
-        if (_slice.end == 0) /* _end=0 equivalent of python's arr[_star:] */                       \
-            _slice.end = _len;                                                                     \
-        else if (unlikely(_slice.end < 0)) _slice.end += _len;                                     \
-        _slice.end = _slice.end < _len ? _slice.end : _len;                                        \
-        _slice.start = _slice.start > 0 ? _slice.start : 0;                                        \
-        /*log$debug("instart: %d, inend: %d, start: %ld, end: %ld\n", start, end, _start, _end); */                                                                                                \
-        if (_slice.start < _slice.end && array != NULL) {                                          \
-            slice.arr = &((array)[_slice.start]);                                                  \
-            slice.len = (usize)(_slice.end - _slice.start);                                        \
-        }                                                                                          \
-    }
-
-
-/**
- * @brief Gets array generic slice (typed as array)
- *
- * Example:
- * var s = arr$slice(arr, .start = 1, .end = -2);
- * var s = arr$slice(arr, 1, -2);
- * var s = arr$slice(arr, .start = -2);
- * var s = arr$slice(arr, .end = 3);
- *
- * Note: arr$slice creates a temporary type, and it's preferable to use var keyword
- *
- * @param array - generic array
- * @param .start - start index, may be negative to get item from the end of array
- * @param .end - end index, 0 - means all, or may be negative to get item from the end of array
- * @return struct {eltype* arr, usize len}, or {NULL, 0} if bad slice index/not found/NULL array
- *
- * @warning returns {.arr = NULL, .len = 0} if bad indexes or array
- */
-#define arr$slice(array, ...)                                                                      \
-    ({                                                                                             \
-        slice$define(*array) s = { .arr = NULL, .len = 0 };                                        \
-        _arr$slice_get(s, array, arr$len(array), __VA_ARGS__);                                     \
-        s;                                                                                         \
-    })
-
-
-/**
- * @brief cex_iterator_s - CEX iterator interface
- */
-typedef struct
-{
-    struct
-    {
-        union
-        {
-            usize i;
-            char* skey;
-            void* pkey;
-        };
-    } idx;
-    char _ctx[47];
-    u8 stopped;
-    u8 initialized;
-} cex_iterator_s;
-_Static_assert(sizeof(usize) == sizeof(void*), "usize expected as sizeof ptr");
-_Static_assert(alignof(usize) == alignof(void*), "alignof pointer != alignof usize");
-_Static_assert(alignof(cex_iterator_s) == alignof(void*), "alignof");
-_Static_assert(sizeof(cex_iterator_s) <= 64, "cex size");
-
-/**
- * @brief Iterates via iterator function (see usage below)
- *
- * Iterator function signature:
- * u32* array_iterator(u32 array[], u32 len, cex_iterator_s* iter)
- *
- * for$iter(u32, it, array_iterator(arr2, arr$len(arr2), &it.iterator))
- */
-#define for$iter(it_val_type, it, iter_func)                                                       \
-    struct cex$tmpname(__cex_iter_)                                                                \
-    {                                                                                              \
-        it_val_type val;                                                                           \
-        union /* NOTE:  iterator above and this struct shadow each other */                        \
-        {                                                                                          \
-            cex_iterator_s iterator;                                                               \
-            struct                                                                                 \
-            {                                                                                      \
-                union                                                                              \
-                {                                                                                  \
-                    usize i;                                                                       \
-                    char* skey;                                                                    \
-                    void* pkey;                                                                    \
-                };                                                                                 \
-            } idx;                                                                                 \
-        };                                                                                         \
-    };                                                                                             \
-                                                                                                   \
-    for (struct cex$tmpname(__cex_iter_) it = { .val = (iter_func) }; !it.iterator.stopped;        \
-         it.val = (iter_func))
 
 
 #if defined(__GNUC__) && !defined(__clang__)
@@ -706,60 +725,175 @@ typedef struct Allocator_i
     //<<< 64 byte cacheline
 } Allocator_i;
 // clang-format on
-_Static_assert(alignof(Allocator_i) == 64, "size");
-_Static_assert(sizeof(Allocator_i) == 64, "size");
-_Static_assert(sizeof((Allocator_i){ 0 }.meta) == 8, "size");
+static_assert(alignof(Allocator_i) == 64, "size");
+static_assert(sizeof(Allocator_i) == 64, "size");
+static_assert(sizeof((Allocator_i){ 0 }.meta) == 8, "size");
 
 
 void _cex_allocator_memscope_cleanup(IAllocator* allc);
 void _cex_allocator_arena_cleanup(IAllocator* allc);
 
+/**
+Mem cheat-sheet
+
+Global allocators:
+
+- `mem$` - heap based allocator, typically used for long-living data, requires explicit mem$free
+- `tmem$` - temporary allocator, based by ArenaAllocator, with 256kb page, requires `mem$scope`
+
+Memory management hints:
+
+- If function accept IAllocator as argument, it allocates memory
+- If class/object accept IAllocator in constructor it should track allocator's instance
+- `mem$scope()` - automatically free memory at scope exit by any reason (`return`, `goto` out,
+`break`)
+- consider `mem$malloc/mem$calloc/mem$realloc/mem$free/mem$new`
+- You can init arena scope with `mem$arena(page_size, arena_var_name)`
+- AllocatorArena grows dynamically if there is no room in existing page, but be careful when you use
+many `realloc()`, it can grow arenas unexpectedly large.
+- Use temp allocator as `mem$scope(tmem$, _) {}` it's a common CEX pattern, `_` is `tmem$`
+short-alias
+- Nested `mem$scope` are allowed, but memory freed at nested scope exit. NOTE: don't share pointers
+across scopes.
+- Use address sanitizers as often as possible
+
+
+Examples:
+
+- Vanilla heap allocator
+```c
+test$case(test_allocator_api)
+{
+    u8* p = mem$malloc(mem$, 100);
+    tassert(p != NULL);
+
+    // mem$free always nullifies pointer
+    mem$free(mem$, p);
+    tassert(p == NULL);
+
+    p = mem$calloc(mem$, 100, 100, 32); // malloc with 32-byte alignment
+    tassert(p != NULL);
+
+    // Allocates new ZII struct based on given type
+    auto my_item = mem$new(mem$, struct my_type_s);
+
+    return EOK;
+}
+
+```
+
+- Temporary memory scope
+
+```c
+mem$scope(tmem$, _)
+{
+    arr$(char*) incl_path = arr$new(incl_path, _);
+    for$each (p, alt_include_path) {
+        arr$push(incl_path, p);
+        if (!os.path.exists(p)) { log$warn("alt_include_path not exists: %s\n", p); }
+    }
+}
+```
+
+- Arena Scope
+
+```c
+mem$arena(4096, arena)
+{
+    // This needs extra page
+    u8* p2 = mem$malloc(arena, 10040);
+    mem$scope(arena, tal)
+    {
+        u8* p3 = mem$malloc(tal, 100);
+    }
+}
+```
+
+- Arena Instance
+
+```c
+IAllocator arena = AllocatorArena.create(4096);
+
+u8* p = mem$malloc(arena, 100); // direct use allowed
+
+mem$scope(arena, tal)
+{
+    // NOTE: this scope will be freed after exit
+    u8* p2 = mem$malloc(tal, 100000);
+
+    mem$scope(arena, tal)
+    {
+        u8* p3 = mem$malloc(tal, 100);
+    }
+}
+
+AllocatorArena.destroy(arena);
+
+```
+*/
+
+#define __mem$
+
+/// Temporary allocator arena (use only in `mem$scope(tmem$, _))`
 #define tmem$ ((IAllocator)(&_cex__default_global__allocator_temp.alloc))
+
+/// General purpose heap allocator
 #define mem$ _cex__default_global__allocator_heap__allc
-#define mem$malloc(alloc, size, alignment...)                                                      \
+
+/// Allocate uninitialized chunk of memory using `allocator`
+#define mem$malloc(allocator, size, alignment...)                                                  \
     ({                                                                                             \
         /* NOLINTBEGIN*/                                                                           \
         usize _alignment[] = { alignment };                                                        \
-        (alloc)->malloc((alloc), size, (sizeof(_alignment) > 0) ? _alignment[0] : 0);              \
-        /* NOLINTEND*/                                                                             \
-    })
-#define mem$calloc(alloc, nmemb, size, alignment...)                                               \
-    ({                                                                                             \
-        /* NOLINTBEGIN */                                                                          \
-        usize _alignment[] = { alignment };                                                        \
-        (alloc)->calloc((alloc), nmemb, size, (sizeof(_alignment) > 0) ? _alignment[0] : 0);       \
+        (allocator)->malloc((allocator), size, (sizeof(_alignment) > 0) ? _alignment[0] : 0);      \
         /* NOLINTEND*/                                                                             \
     })
 
-#define mem$realloc(alloc, old_ptr, size, alignment...)                                            \
+/// Allocate zero initialized chunk of memory using `allocator`
+#define mem$calloc(allocator, nmemb, size, alignment...)                                           \
     ({                                                                                             \
         /* NOLINTBEGIN */                                                                          \
         usize _alignment[] = { alignment };                                                        \
-        (alloc)->realloc((alloc), old_ptr, size, (sizeof(_alignment) > 0) ? _alignment[0] : 0);    \
+        (allocator)                                                                                \
+            ->calloc((allocator), nmemb, size, (sizeof(_alignment) > 0) ? _alignment[0] : 0);      \
         /* NOLINTEND*/                                                                             \
     })
 
-#define mem$free(alloc, ptr)                                                                       \
+/// Reallocate chunk of memory using `allocator`
+#define mem$realloc(allocator, old_ptr, size, alignment...)                                        \
     ({                                                                                             \
-        (ptr) = (alloc)->free((alloc), ptr);                                                       \
+        /* NOLINTBEGIN */                                                                          \
+        usize _alignment[] = { alignment };                                                        \
+        (allocator)                                                                                \
+            ->realloc((allocator), old_ptr, size, (sizeof(_alignment) > 0) ? _alignment[0] : 0);   \
+        /* NOLINTEND*/                                                                             \
+    })
+
+/// Free previously allocated chunk of memory, `ptr` implicitly set to NULL
+#define mem$free(allocator, ptr)                                                                   \
+    ({                                                                                             \
+        (ptr) = (allocator)->free((allocator), ptr);                                               \
         (ptr) = NULL;                                                                              \
         (ptr);                                                                                     \
     })
 
-// TODO: IDEA -- add optional argument (count)
-#define mem$new(alloc, T) (typeof(T)*)(alloc)->calloc((alloc), 1, sizeof(T), _Alignof(T))
-/*
- */
+/// Allocates generic type instance using `allocator`, result is zero filled, size and alignment
+/// derived from type T
+#define mem$new(allocator, T)                                                                      \
+    (typeof(T)*)(allocator)->calloc((allocator), 1, sizeof(T), _Alignof(T))
 
 // clang-format off
-#define mem$scope(alloc, allc_var)                                                                                                                                           \
+
+/// Opens new memory scope using Arena-like allocator, frees all memory after scope exit
+#define mem$scope(allocator, allc_var)                                                                                                                                           \
     u32 cex$tmpname(tallc_cnt) = 0;                                                                                                                                \
     for (IAllocator allc_var  \
         __attribute__ ((__cleanup__(_cex_allocator_memscope_cleanup))) =  \
-                                                        (alloc)->scope_enter(alloc); \
+                                                        (allocator)->scope_enter(allocator); \
         cex$tmpname(tallc_cnt) < 1; \
         cex$tmpname(tallc_cnt)++)
 
+/// Creates new ArenaAllocator instance in scope, frees it at scope exit
 #define mem$arena(page_size, allc_var)                                                                                                                                           \
     u32 cex$tmpname(tallc_cnt) = 0;                                                                                                                                \
     for (IAllocator allc_var  \
@@ -769,17 +903,23 @@ void _cex_allocator_arena_cleanup(IAllocator* allc);
         cex$tmpname(tallc_cnt)++)
 // clang-format on
 
+/// Checks if `s` value is power of 2
 #define mem$is_power_of2(s) (((s) != 0) && (((s) & ((s) - 1)) == 0))
 
+/// Rounds `size` to the closest alignment
 #define mem$aligned_round(size, alignment)                                                         \
     (usize)((((usize)(size)) + ((usize)alignment) - 1) & ~(((usize)alignment) - 1))
 
+/// Checks if pointer address of `p` is aligned to `alignment`
 #define mem$aligned_pointer(p, alignment) (void*)mem$aligned_round(p, alignment)
 
+/// Returns 32 for 32-bit platform, or 64 for 64-bit platform
 #define mem$platform() __SIZEOF_SIZE_T__ * 8
 
+/// Gets address of struct member
 #define mem$addressof(typevar, value) ((typeof(typevar)[1]){ (value) })
 
+/// Gets offset in bytes of struct member
 #define mem$offsetof(var, field) ((char*)&(var)->field - (char*)(var))
 
 
@@ -821,6 +961,8 @@ void __asan_unpoison_memory_region(void const volatile* addr, size_t size);
 void* __asan_region_is_poisoned(void* beg, size_t size);
 
 #    if mem$asan_enabled()
+
+/// Poisons memory region with ASAN, or fill it with 0xf7 byte pattern (no ASAN)
 #        define mem$asan_poison(addr, size)                                                        \
             ({                                                                                     \
                 void* _addr = (addr);                                                              \
@@ -834,6 +976,8 @@ void* __asan_region_is_poisoned(void* beg, size_t size);
                 }                                                                                  \
                 __asan_poison_memory_region(_addr, _size);                                         \
             })
+
+/// Unpoisons memory region with ASAN, or fill it with 0x00 byte pattern (no ASAN)
 #        define mem$asan_unpoison(addr, size)                                                      \
             ({                                                                                     \
                 void* _addr = (addr);                                                              \
@@ -845,6 +989,8 @@ void* __asan_region_is_poisoned(void* beg, size_t size);
                     _size                                                                          \
                 ); /* Marks are only enabled in CEX_TEST */                                        \
             })
+
+/// Check if previously poisoned address is consistent, and 0x7f pattern not overwritten (no ASAN)
 #        define mem$asan_poison_check(addr, size)                                                  \
             ({                                                                                     \
                 void* _addr = addr;                                                                \
@@ -889,8 +1035,8 @@ typedef struct
     } stats;
 } AllocatorHeap_c;
 
-_Static_assert(sizeof(AllocatorHeap_c) == 128, "size!");
-_Static_assert(offsetof(AllocatorHeap_c, alloc) == 0, "base must be the 1st struct member");
+static_assert(sizeof(AllocatorHeap_c) == 128, "size!");
+static_assert(offsetof(AllocatorHeap_c, alloc) == 0, "base must be the 1st struct member");
 
 extern AllocatorHeap_c _cex__default_global__allocator_heap;
 extern IAllocator const _cex__default_global__allocator_heap__allc;
@@ -930,8 +1076,8 @@ typedef struct
 
 } AllocatorArena_c;
 
-_Static_assert(sizeof(AllocatorArena_c) <= 256, "size!");
-_Static_assert(offsetof(AllocatorArena_c, alloc) == 0, "base must be the 1st struct member");
+static_assert(sizeof(AllocatorArena_c) <= 256, "size!");
+static_assert(offsetof(AllocatorArena_c, alloc) == 0, "base must be the 1st struct member");
 
 typedef struct allocator_arena_page_s
 {
@@ -943,9 +1089,9 @@ typedef struct allocator_arena_page_s
     u8 __poison_area[(sizeof(usize) == 8 ? 32 : 44)]; // barrier of sanitizer poison + space reserve
     char data[];                                      // trailing chunk of data
 } allocator_arena_page_s;
-_Static_assert(sizeof(allocator_arena_page_s) == 64, "size!");
-_Static_assert(alignof(allocator_arena_page_s) == 64, "align");
-_Static_assert(offsetof(allocator_arena_page_s, data) == 64, "data must be aligned to 64");
+static_assert(sizeof(allocator_arena_page_s) == 64, "size!");
+static_assert(alignof(allocator_arena_page_s) == 64, "align");
+static_assert(offsetof(allocator_arena_page_s, data) == 64, "data must be aligned to 64");
 
 typedef struct allocator_arena_rec_s
 {
@@ -955,8 +1101,8 @@ typedef struct allocator_arena_rec_s
     u8 is_free;       // indication that address has been free()'d
     u8 ptr_offset;    // byte offset for allocated pointer for this item
 } allocator_arena_rec_s;
-_Static_assert(sizeof(allocator_arena_rec_s) == 8, "size!");
-_Static_assert(offsetof(allocator_arena_rec_s, ptr_offset) == 7, "ptr_offset must be last");
+static_assert(sizeof(allocator_arena_rec_s) == 8, "size!");
+static_assert(offsetof(allocator_arena_rec_s, ptr_offset) == 7, "ptr_offset must be last");
 
 extern _Thread_local AllocatorArena_c _cex__default_global__allocator_temp;
 
@@ -978,6 +1124,77 @@ CEX_NAMESPACE struct __cex_namespace__AllocatorArena AllocatorArena;
 /*
 *                          src/ds.h
 */
+
+/**
+
+* Creating array
+```c
+    // Using heap allocator (need to free later!)
+    arr$(i32) array = arr$new(array, mem$);
+
+    // adding elements
+    arr$pushm(array, 1, 2, 3); // multiple at once
+    arr$push(array, 4); // single element
+
+    // length of array
+    arr$len(array);
+
+    // getting i-th elements
+    array[1];
+
+    // iterating array (by value)
+    for$each(it, array) {
+        io.printf("el=%d\n", it);
+    }
+
+    // iterating array (by pointer - prefer for bigger structs to avoid copying)
+    for$eachp(it, array) {
+        // TIP: making array index out of `it`
+        usize i = it - array;
+
+        // NOTE: 'it' now is a pointer
+        io.printf("el[%zu]=%d\n", i, *it);
+    }
+
+    // free resources
+    arr$free(array);
+```
+
+* Array of structs
+```c
+
+typedef struct
+{
+    int key;
+    float my_val;
+    char* my_string;
+    int value;
+} my_struct;
+
+void somefunc(void)
+{
+    arr$(my_struct) array = arr$new(array, mem$, .capacity = 128);
+    uassert(arr$cap(array), 128);
+
+    my_struct s;
+    s = (my_struct){ 20, 5.0, "hello ", 0 };
+    arr$push(array, s);
+    s = (my_struct){ 40, 2.5, "failure", 0 };
+    arr$push(array, s);
+    s = (my_struct){ 40, 1.1, "world!", 0 };
+    arr$push(array, s);
+
+    for (usize i = 0; i < arr$len(array); ++i) {
+        io.printf("key: %d str: %s\n", array[i].key, array[i].my_string);
+    }
+    arr$free(array);
+
+    return EOK;
+}
+```
+
+*/
+#define __arr$
 
 // this is a simple string arena allocator, initialize with e.g. 'cexds_string_arena my_arena={0}'.
 typedef struct _cexds__string_arena _cexds__string_arena;
@@ -1035,23 +1252,25 @@ typedef struct
     usize length; // This MUST BE LAST before __poison_area
     u8 __poison_area[8];
 } _cexds__array_header;
-_Static_assert(alignof(_cexds__array_header) == alignof(usize), "align");
-_Static_assert(
+static_assert(alignof(_cexds__array_header) == alignof(usize), "align");
+static_assert(
     sizeof(usize) == 8 ? sizeof(_cexds__array_header) == 48 : sizeof(_cexds__array_header) == 32,
     "size for x64 is 48 / for x32 is 32"
 );
 
 #define _cexds__header(t) ((_cexds__array_header*)(((char*)(t)) - sizeof(_cexds__array_header)))
 
+/// Generic array type definition. Use arr$(int) myarr - defines new myarr variable, as int array
 #define arr$(T) T*
 
 struct _cexds__arr_new_kwargs_s
 {
     usize capacity;
 };
+/// Array initialization: use arr$(int) arr = arr$new(arr, mem$, .capacity = , ...)
 #define arr$new(a, allocator, kwargs...)                                                           \
     ({                                                                                             \
-        _Static_assert(_Alignof(typeof(*a)) <= 64, "array item alignment too high");               \
+        static_assert(_Alignof(typeof(*a)) <= 64, "array item alignment too high");                \
         uassert(allocator != NULL);                                                                \
         struct _cexds__arr_new_kwargs_s _kwargs = { kwargs };                                      \
         (a) = (typeof(*a)*)_cexds__arrgrowf(                                                       \
@@ -1064,12 +1283,19 @@ struct _cexds__arr_new_kwargs_s
         );                                                                                         \
     })
 
+/// Free resources for dynamic array (only needed if mem$ allocator was used)
 #define arr$free(a) (_cexds__arr_integrity(a, _CEXDS_ARR_MAGIC), _cexds__arrfreef((a)), (a) = NULL)
 
+/// Set array capacity and resize if needed
 #define arr$setcap(a, n) (_cexds__arr_integrity(a, _CEXDS_ARR_MAGIC), arr$grow(a, 0, n))
+
+/// Clear array contents
 #define arr$clear(a) (_cexds__arr_integrity(a, _CEXDS_ARR_MAGIC), _cexds__header(a)->length = 0)
+
+/// Returns current array capacity
 #define arr$cap(a) ((a) ? (_cexds__header(a)->capacity) : 0)
 
+/// Delete array elements by index (memory will be shifted, order preserved)
 #define arr$del(a, i)                                                                              \
     ({                                                                                             \
         _cexds__arr_integrity(a, _CEXDS_ARR_MAGIC);                                                \
@@ -1077,6 +1303,8 @@ struct _cexds__arr_new_kwargs_s
         memmove(&(a)[i], &(a)[(i) + 1], sizeof *(a) * (_cexds__header(a)->length - 1 - (i)));      \
         _cexds__header(a)->length--;                                                               \
     })
+
+/// Delete element by swapping with last one (no memory overhear, element order changes)
 #define arr$delswap(a, i)                                                                          \
     ({                                                                                             \
         _cexds__arr_integrity(a, _CEXDS_ARR_MAGIC);                                                \
@@ -1085,12 +1313,15 @@ struct _cexds__arr_new_kwargs_s
         _cexds__header(a)->length -= 1;                                                            \
     })
 
+/// Return last element of array
 #define arr$last(a)                                                                                \
     ({                                                                                             \
         _cexds__arr_integrity(a, _CEXDS_ARR_MAGIC);                                                \
         uassert(_cexds__header(a)->length > 0 && "empty array");                                   \
         (a)[_cexds__header(a)->length - 1];                                                        \
     })
+
+/// Get element at index (bounds checking with uassert())
 #define arr$at(a, i)                                                                               \
     ({                                                                                             \
         _cexds__arr_integrity(a, 0); /* may work also on hm$ */                                    \
@@ -1098,6 +1329,7 @@ struct _cexds__arr_new_kwargs_s
         (a)[i];                                                                                    \
     })
 
+/// Pop element from the end
 #define arr$pop(a)                                                                                 \
     ({                                                                                             \
         _cexds__arr_integrity(a, _CEXDS_ARR_MAGIC);                                                \
@@ -1105,6 +1337,7 @@ struct _cexds__arr_new_kwargs_s
         (a)[_cexds__header(a)->length];                                                            \
     })
 
+/// Push element to the end
 #define arr$push(a, value...)                                                                      \
     ({                                                                                             \
         if (unlikely(!arr$grow_check(a, 1))) {                                                     \
@@ -1114,15 +1347,17 @@ struct _cexds__arr_new_kwargs_s
         (a)[_cexds__header(a)->length++] = (value);                                                \
     })
 
+/// Push many elements to the end
 #define arr$pushm(a, items...)                                                                     \
     ({                                                                                             \
         /* NOLINTBEGIN */                                                                          \
         typeof(*a) _args[] = { items };                                                            \
-        _Static_assert(sizeof(_args) > 0, "You must pass at least one item");                      \
+        static_assert(sizeof(_args) > 0, "You must pass at least one item");                       \
         arr$pusha(a, _args, arr$len(_args));                                                       \
         /* NOLINTEND */                                                                            \
     })
 
+/// Push another array into a. array can be dynamic or static or pointer+len
 #define arr$pusha(a, array, array_len...)                                                          \
     ({                                                                                             \
         /* NOLINTBEGIN */                                                                          \
@@ -1140,6 +1375,7 @@ struct _cexds__arr_new_kwargs_s
         for (usize i = 0; i < arr_len; i++) { (a)[_cexds__header(a)->length++] = ((array)[i]); }   \
     })
 
+/// Sort array with qsort() libc function
 #define arr$sort(a, qsort_cmp)                                                                     \
     ({                                                                                             \
         _cexds__arr_integrity(a, _CEXDS_ARR_MAGIC);                                                \
@@ -1147,6 +1383,7 @@ struct _cexds__arr_new_kwargs_s
     })
 
 
+/// Inserts element into array at index `i`
 #define arr$ins(a, i, value...)                                                                    \
     do {                                                                                           \
         if (unlikely(!arr$grow_check(a, 1))) {                                                     \
@@ -1159,12 +1396,14 @@ struct _cexds__arr_new_kwargs_s
         (a)[i] = (value);                                                                          \
     } while (0)
 
+/// Check array capacity and return false on memory error
 #define arr$grow_check(a, add_extra)                                                               \
     ((_cexds__arr_integrity(a, _CEXDS_ARR_MAGIC) &&                                                \
       _cexds__header(a)->length + (add_extra) > _cexds__header(a)->capacity)                       \
          ? (arr$grow(a, add_extra, 0), a != NULL)                                                  \
          : true)
 
+/// Grows array capacity
 #define arr$grow(a, add_len, min_cap)                                                              \
     ((a) = _cexds__arrgrowf((a), sizeof *(a), (add_len), (min_cap), alignof(typeof(*a)), NULL))
 
@@ -1182,6 +1421,7 @@ struct _cexds__arr_new_kwargs_s
                   );                                                                               \
         })
 #else
+/// Versatile array length, works with dynamic (arr$) and static compile time arrays
 #    define arr$len(arr)                                                                           \
         ({                                                                                         \
             _Pragma("GCC diagnostic push");                                                        \
@@ -1208,7 +1448,142 @@ _cex__get_buf_addr(void* a)
     return (a != NULL) ? &((char*)a)[0] : NULL;
 }
 
-#define for$each(v, array, array_len...)                                                           \
+
+/*
+ *                  ARRAYS ITERATORS INTERFACE
+ */
+
+/**
+
+- using for$ as unified array iterator
+
+```c
+
+test$case(test_array_iteration)
+{
+    arr$(int) array = arr$new(array, mem$);
+    arr$pushm(array, 1, 2, 3);
+
+    for$each(it, array) {
+        io.printf("el=%d\n", it);
+    }
+    // Prints:
+    // el=1
+    // el=2
+    // el=3
+
+    // NOTE: prefer this when you work with bigger structs to avoid extra memory copying
+    for$eachp(it, array) {
+        // TIP: making array index out of `it`
+        usize i = it - array;
+
+        // NOTE: it now is a pointer
+        io.printf("el[%zu]=%d\n", i, *it);
+    }
+    // Prints:
+    // el[0]=1
+    // el[1]=2
+    // el[2]=3
+
+    // Static arrays work as well (arr$len inferred)
+    i32 arr_int[] = {1, 2, 3, 4, 5};
+    for$each(it, arr_int) {
+        io.printf("static=%d\n", it);
+    }
+    // Prints:
+    // static=1
+    // static=2
+    // static=3
+    // static=4
+    // static=5
+
+
+    // Simple pointer+length also works (let's do a slice)
+    i32* slice = &arr_int[2];
+    for$each(it, slice, 2) {
+        io.printf("slice=%d\n", it);
+    }
+    // Prints:
+    // slice=3
+    // slice=4
+
+
+    // it is type of cex_iterator_s
+    // NOTE: run in shell: ➜ ./cex help cex_iterator_s
+    s = str.sstr("123,456");
+    for$iter (str_s, it, str.slice.iter_split(s, ",", &it.iterator)) {
+        io.printf("it.value = %S\n", it.val);
+    }
+    // Prints:
+    // it.value = 123
+    // it.value = 456
+
+    arr$free(array);
+    return EOK;
+}
+
+```
+
+*/
+#define __for$
+
+/**
+ * @brief cex_iterator_s - CEX iterator interface
+ */
+typedef struct
+{
+    struct
+    {
+        union
+        {
+            usize i;
+            char* skey;
+            void* pkey;
+        };
+    } idx;
+    char _ctx[47];
+    u8 stopped;
+    u8 initialized;
+} cex_iterator_s;
+static_assert(sizeof(usize) == sizeof(void*), "usize expected as sizeof ptr");
+static_assert(alignof(usize) == alignof(void*), "alignof pointer != alignof usize");
+static_assert(alignof(cex_iterator_s) == alignof(void*), "alignof");
+static_assert(sizeof(cex_iterator_s) <= 64, "cex size");
+
+/**
+ * @brief Iterates via iterator function (see usage below)
+ *
+ * Iterator function signature:
+ * u32* array_iterator(u32 array[], u32 len, cex_iterator_s* iter)
+ *
+ * for$iter(u32, it, array_iterator(arr2, arr$len(arr2), &it.iterator))
+ */
+#define for$iter(it_val_type, it, iter_func)                                                       \
+    struct cex$tmpname(__cex_iter_)                                                                \
+    {                                                                                              \
+        it_val_type val;                                                                           \
+        union /* NOTE:  iterator above and this struct shadow each other */                        \
+        {                                                                                          \
+            cex_iterator_s iterator;                                                               \
+            struct                                                                                 \
+            {                                                                                      \
+                union                                                                              \
+                {                                                                                  \
+                    usize i;                                                                       \
+                    char* skey;                                                                    \
+                    void* pkey;                                                                    \
+                };                                                                                 \
+            } idx;                                                                                 \
+        };                                                                                         \
+    };                                                                                             \
+                                                                                                   \
+    for (struct cex$tmpname(__cex_iter_) it = { .val = (iter_func) }; !it.iterator.stopped;        \
+         it.val = (iter_func))
+
+
+/// Iterates over arrays `it` is iterated **value**, array may be arr$/or static / or pointer,
+/// array_len is only required for pointer+len use case
+#define for$each(it, array, array_len...)                                                          \
     /* NOLINTBEGIN*/                                                                               \
     usize cex$tmpname(arr_length_opt)[] = { array_len }; /* decide if user passed array_len */     \
     usize cex$tmpname(arr_length) = (sizeof(cex$tmpname(arr_length_opt)) > 0)                      \
@@ -1218,13 +1593,15 @@ _cex__get_buf_addr(void* a)
     usize cex$tmpname(arr_index) = 0;                                                              \
     uassert(cex$tmpname(arr_length) < PTRDIFF_MAX && "negative length or overflow");               \
     /* NOLINTEND */                                                                                \
-    for (typeof((array)[0]) v = { 0 };                                                             \
+    for (typeof((array)[0]) it = { 0 };                                                            \
          (cex$tmpname(arr_index) < cex$tmpname(arr_length) &&                                      \
-          ((v) = cex$tmpname(arr_arrp)[cex$tmpname(arr_index)], 1));                               \
+          ((it) = cex$tmpname(arr_arrp)[cex$tmpname(arr_index)], 1));                              \
          cex$tmpname(arr_index)++)
 
 
-#define for$eachp(v, array, array_len...)                                                          \
+/// Iterates over arrays `it` is iterated by **pointer**, array may be arr$/or static / or pointer,
+/// array_len is only required for pointer+len use case
+#define for$eachp(it, array, array_len...)                                                         \
     /* NOLINTBEGIN*/                                                                               \
     usize cex$tmpname(arr_length_opt)[] = { array_len }; /* decide if user passed array_len */     \
     usize cex$tmpname(arr_length) = (sizeof(cex$tmpname(arr_length_opt)) > 0)                      \
@@ -1234,14 +1611,177 @@ _cex__get_buf_addr(void* a)
     typeof((array)[0])* cex$tmpname(arr_arrp) = _cex__get_buf_addr(array);                         \
     usize cex$tmpname(arr_index) = 0;                                                              \
     /* NOLINTEND */                                                                                \
-    for (typeof((array)[0])* v = cex$tmpname(arr_arrp);                                            \
+    for (typeof((array)[0])* it = cex$tmpname(arr_arrp);                                           \
          cex$tmpname(arr_index) < cex$tmpname(arr_length);                                         \
-         cex$tmpname(arr_index)++, v++)
+         cex$tmpname(arr_index)++, it++)
 
 /*
  *                 HASH MAP
  */
 
+/**
+Generic type-safe hashmap
+
+Principles:
+
+1. Data is backed by engine similar to arr$
+2. `arr$len()` works with hashmap too
+3. Array indexing works with hashmap
+4. `for$each`/`for$eachp` is applicable
+5. `hm$` generic type is essentially a struct with `key` and `value` fields
+6. `hm$` supports following keys: numeric (by default it's just binary representation), char*,
+char[N], str_s (CEX sting slice).
+7. `hm$` with string keys are stored without copy, use  `hm$new(hm, mem$, .copy_keys = true)` for
+copy-mode.
+8. `hm$` can store string keys inside an Arena allocator when  `hm$new(hm, mem$, .copy_keys = true,
+.copy_keys_arena_pgsize = NNN)`
+
+
+```c
+
+test$case(test_simple_hashmap)
+{
+    hm$(int, int) intmap = hm$new(intmap, mem$);
+
+    // Setting items
+    hm$set(intmap, 15, 7);
+    hm$set(intmap, 11, 3);
+    hm$set(intmap, 9, 5);
+
+    // Length
+    tassert_eq(hm$len(intmap), 3);
+    tassert_eq(arr$len(intmap), 3);
+
+    // Getting items **by value**
+    tassert(hm$get(intmap, 9) == 5);
+    tassert(hm$get(intmap, 11) == 3);
+    tassert(hm$get(intmap, 15) == 7);
+
+    // Getting items **pointer** - NULL on missing
+    tassert(hm$getp(intmap, 1) == NULL);
+
+    // Getting with default if not found
+    tassert_eq(hm$get(intmap64, -1, 999), 999);
+
+    // Accessing hashmap as array by i-th index
+    // NOTE: hashmap elements are ordered until first deletion
+    tassert_eq(intmap[0].key, 1);
+    tassert_eq(intmap[0].value, 3);
+
+    // removing items
+    hm$del(intmap, 100);
+
+    // cleanup
+    hm$clear(intmap);
+
+    // basic iteration **by value**
+    for$each (it, intmap) {
+        io.printf("key=%d, value=%d\n", it.key, it.value);
+    }
+
+    // basic iteration **by pointer**
+    for$each (it, intmap) {
+        io.printf("key=%d, value=%d\n", it->key, it->value);
+    }
+
+    hm$free(intmap);
+}
+
+```
+
+- Using hashmap as field of other struct
+```c
+
+typedef hm$(char* , int) MyHashmap;
+
+struct my_hm_struct {
+    MyHashmap hm;
+};
+
+
+test$case(test_hashmap_string_copy_clear_cleanup)
+{
+    struct my_hm_struct hs = {0};
+    // NOTE: .copy_keys - makes sure that key string was copied
+    hm$new(hs.hm, mem$, .copy_keys = true);
+    hm$set(hs.hm, "foo", 3);
+}
+```
+
+- Storing string values in the arena
+```c
+
+test$case(test_hashmap_string_copy_arena)
+{
+    hm$(char*, int) smap = hm$new(smap, mem$, .copy_keys = true, .copy_keys_arena_pgsize = 1024);
+
+    char key2[10] = "foo";
+
+    hm$set(smap, key2, 3);
+    tassert_eq(hm$len(smap), 1);
+    tassert_eq(hm$get(smap, "foo"), 3);
+    tassert_eq(hm$get(smap, key2), 3);
+    tassert_eq(smap[0].key, "foo");
+
+    memset(key2, 0, sizeof(key2));
+    tassert_eq(smap[0].key, "foo");
+    tassert_eq(hm$get(smap, "foo"), 3);
+
+    hm$free(smap);
+    return EOK;
+}
+
+```
+
+- Checking errors + custom struct backing
+```c
+
+test$case(test_hashmap_basic)
+{
+    hm$(int, int) intmap;
+    if(hm$new(intmap, mem$) == NULL) {
+        // initialization error
+    }
+
+    // struct as a value
+    struct test64_s
+    {
+        usize foo;
+        usize bar;
+    };
+    hm$(int, struct test64_s) intmap = hm$new(intmap, mem$);
+
+    // custom struct as hashmap backend
+    struct test64_s
+    {
+        usize fooa;
+        usize key; // this field `key` is mandatory
+    };
+
+    hm$s(struct test64_s) smap = hm$new(smap, mem$);
+    tassert(smap != NULL);
+
+    // Setting hashmap as a whole struct key/value record
+    tassert(hm$sets(smap, (struct test64_s){ .key = 1, .fooa = 10 }));
+    tassert_eq(hm$len(smap), 1);
+    tassert_eq(smap[0].key, 1);
+    tassert_eq(smap[0].fooa, 10);
+
+    // Getting full struct by .key value
+    struct test64_s* r = hm$gets(smap, 1);
+    tassert(r != NULL);
+    tassert(r == &smap[0]);
+    tassert_eq(r->key, 1);
+    tassert_eq(r->fooa, 10);
+
+}
+
+```
+
+*/
+#define __hm$
+
+/// Defines hashmap generic type
 #define hm$(_KeyType, _ValType)                                                                    \
     struct                                                                                         \
     {                                                                                              \
@@ -1249,20 +1789,24 @@ _cex__get_buf_addr(void* a)
         _ValType value;                                                                            \
     }*
 
+/// Defines hashmap type based on _StructType, must have `key` field
 #define hm$s(_StructType) _StructType*
 
+/// hm$new(kwargs...) - default values always zeroed (ZII)
 struct _cexds__hm_new_kwargs_s
 {
-    usize capacity;
-    usize seed;
-    u32 copy_keys_arena_pgsize;
-    bool copy_keys;
+    usize capacity; // initial hashmap capacity (default: 16)
+    usize seed; // initial hashmap hash algorithm seed: (default: some const value)
+    u32 copy_keys_arena_pgsize; // use arena for backing string keys copy (default: false)
+    bool copy_keys; // duplicate/copy string keys when adding new records (default: false)
 };
 
 
+/// Creates new hashmap of hm$(KType, VType) using allocator, kwargs: .capacity, .seed,
+/// .copy_keys_arena_pgsize, .copy_keys
 #define hm$new(t, allocator, kwargs...)                                                            \
     ({                                                                                             \
-        _Static_assert(_Alignof(typeof(*t)) <= 64, "hashmap record alignment too high");           \
+        static_assert(_Alignof(typeof(*t)) <= 64, "hashmap record alignment too high");            \
         uassert(allocator != NULL);                                                                \
         enum _CexDsKeyType_e _key_type = _Generic(                                                 \
             &((t)->key),                                                                           \
@@ -1279,6 +1823,7 @@ struct _cexds__hm_new_kwargs_s
     })
 
 
+/// Set hashmap key/value, replaces if exists 
 #define hm$set(t, k, v...)                                                                         \
     ({                                                                                             \
         typeof(t) result = NULL;                                                                   \
@@ -1295,6 +1840,7 @@ struct _cexds__hm_new_kwargs_s
         result;                                                                                    \
     })
 
+/// Add new item and returns pointer of hashmap record for `k`, for further editing  
 #define hm$setp(t, k)                                                                              \
     ({                                                                                             \
         typeof(t) result = NULL;                                                                   \
@@ -1310,6 +1856,7 @@ struct _cexds__hm_new_kwargs_s
         (result ? &result->value : NULL);                                                          \
     })
 
+/// Set full record, must be initialized by user
 #define hm$sets(t, v...)                                                                           \
     ({                                                                                             \
         typeof(t) result = NULL;                                                                   \
@@ -1326,6 +1873,7 @@ struct _cexds__hm_new_kwargs_s
         result;                                                                                    \
     })
 
+/// Get item by value, def - default value (zeroed by default), can be any type
 #define hm$get(t, k, def...)                                                                       \
     ({                                                                                             \
         typeof(t) result = _cexds__hmget_key(                                                      \
@@ -1339,6 +1887,7 @@ struct _cexds__hm_new_kwargs_s
         result ? result->value : _def[0];                                                          \
     })
 
+/// Get item by pointer (no copy, direct pointer inside hashmap)
 #define hm$getp(t, k)                                                                              \
     ({                                                                                             \
         typeof(t) result = _cexds__hmget_key(                                                      \
@@ -1351,6 +1900,7 @@ struct _cexds__hm_new_kwargs_s
         result ? &result->value : NULL;                                                            \
     })
 
+/// Get a pointer to full hashmap record, NULL if not found
 #define hm$gets(t, k)                                                                              \
     ({                                                                                             \
         typeof(t) result = _cexds__hmget_key(                                                      \
@@ -1363,6 +1913,7 @@ struct _cexds__hm_new_kwargs_s
         result;                                                                                    \
     })
 
+/// Clears hashmap contents
 #define hm$clear(t)                                                                                \
     ({                                                                                             \
         _cexds__arr_integrity(t, _CEXDS_HM_MAGIC);                                                 \
@@ -1372,6 +1923,7 @@ struct _cexds__hm_new_kwargs_s
         true;                                                                                      \
     })
 
+/// Deletes items, IMPORTANT hashmap array may be reordered after this call
 #define hm$del(t, k)                                                                               \
     ({                                                                                             \
         _cexds__hmdel_key(                                                                         \
@@ -1384,8 +1936,10 @@ struct _cexds__hm_new_kwargs_s
     })
 
 
+/// Frees hashmap resources
 #define hm$free(t) (_cexds__hmfree_func((t), sizeof *(t), offsetof(typeof(*t), key)), (t) = NULL)
 
+/// Returns hashmap length, also you can use arr$len()
 #define hm$len(t)                                                                                  \
     ({                                                                                             \
         if (t != NULL) { _cexds__arr_integrity(t, _CEXDS_HM_MAGIC); }                              \
@@ -1558,8 +2112,8 @@ typedef struct
     char* buf;
 } str_s;
 
-_Static_assert(alignof(str_s) == alignof(usize), "align");
-_Static_assert(sizeof(str_s) == sizeof(usize) * 2, "size");
+static_assert(alignof(str_s) == alignof(usize), "align");
+static_assert(sizeof(str_s) == sizeof(usize) * 2, "size");
 
 
 /**
@@ -1571,16 +2125,6 @@ _Static_assert(sizeof(str_s) == sizeof(usize) * 2, "size");
 #define str$s(string)                                                                              \
     (str_s){ .buf = /* WARNING: only literals!!!*/ "" string, .len = sizeof((string)) - 1 }
 
-
-/**
- * @brief creates slice of str_s instance
- */
-#define str$sslice(str_self, ...)                                                                  \
-    ({                                                                                             \
-        slice$define(*(str_self.buf)) __slice = { .arr = NULL, .len = 0 };                         \
-        _arr$slice_get(__slice, str_self.buf, str_self.len, __VA_ARGS__);                          \
-        __slice;                                                                                   \
-    })
 
 /// Joins parts of strings using a separator str$join(allc, ",", "a", "b", "c") -> "a,b,c"
 #define str$join(allocator, str_join_by, str_parts...)                                             \
@@ -1619,34 +2163,189 @@ _Static_assert(sizeof(str_s) == sizeof(usize) * 2, "size");
     ) \
 )(str_or_slice, out_var_ptr)
 
-struct __cex_namespace__str {
+/**
+
+CEX string principles:
+
+- `str` namespace is build for compatibility with C strings
+- all string functions are NULL resilient
+- all string functions can return NULL on error
+- you don't have to check every operation for NULL every time, just at the end
+- all string format operations support CEX specific specificators (see below)
+
+String slices:
+
+- Slices are backed by `(str_s){.buf = s, .len = NNN}` struct
+- Slices are passed by value and allocated on stack
+- Slices can be made from null-terminated strings, or buffers, or literals
+- str$s("hello") - use this for compile time defined slices/constants
+- Slices are not guaranteed to be null-terminated
+- Slices support operations which allowed by read-only string view representation
+- CEX formatting uses `%S` for slices: `io.print("Hello %S\n", str$s("world"))`
+
+
+- Working with slices:
+```c
+
+test$case(test_cstr)
+{
+    char* cstr = "hello";
+    str_s s = str.sstr(cstr);
+    tassert_eq(s.buf, cstr);
+    tassert_eq(s.len, 5);
+    tassert(s.buf == cstr);
+    tassert_eq(str.len(s.buf), 5);
+}
+
+```
+
+- Getting substring as slices
+```c
+
+str.sub("123456", 0, 0); // slice: 123456
+str.sub("123456", 1, 0); // slice: 23456
+str.sub("123456", 1, -1); // slice: 2345
+str.sub("123456", -3, -1); // slice: 345
+str.sub("123456", -30, 2000); // slice: (str_s){.buf = NULL, .len = 0} (error, but no crash)
+
+// works with slices too
+str_s s = str.sstr("123456");
+str_s sub = str.slice.sub(s, 1, 2);
+
+```
+
+- Splitting / iterating via tokens
+
+```c
+
+// Working without mem allocation
+s = str.sstr("123,456");
+for$iter (str_s, it, str.slice.iter_split(s, ",", &it.iterator)) {
+    io.printf("%S\n", it.val); // NOTE: it.val is non null-terminated slice
+}
+
+
+// Mem allocating split
+mem$scope(tmem$, _)
+{
+
+    // NOTE: each `res` item will be allocated C-string, use tmem$ or deallocate independently
+    arr$(char*) res = str.split("123,456,789", ",", _);
+    tassert(res != NULL); // NULL on error
+
+    for$each (v, res) {
+        io.printf("%s\n", v); // NOTE: strings now cloned and null-terminated
+    }
+}
+
+```
+
+- Chaining string operations
+```c
+
+mem$scope(tmem$, _)
+{
+    char* s = str.fmt(_, "hi there"); // NULL on error
+    s = str.replace(s, "hi", "hello", _); // NULL tolerant, NULL on error
+    s = str.fmt(_, "result is: %s", s); // NULL tolerant, NULL on error
+    if (s == NULL) {
+        // TODO: oops error occurred, in one of three operations, but we don't need to check each one
+    }
+
+    tassert_eq(s, "result is: hello there");
+}
+```
+
+- Pattern matching
+
+```c
+// Pattern matching 101
+// * - one or more characters
+// ? - one character
+// [abc] - one character a or b or c
+// [!abc] - one character, but not a or b or c
+// [abc+] - one or more characters a or b or c
+// [a-cA-C0-9] - one character in a range of characters
+// \\* - escaping literal '*'
+// (abc|def|xyz) - matching combination of words abc or def or xyz
+
+tassert(str.match("test.txt", "*?txt"));
+tassert(str.match("image.png", "image.[jp][pn]g"));
+tassert(str.match("backup.txt", "[!a]*.txt"));
+tassert(!str.match("D", "[a-cA-C0-9]"));
+tassert(str.match("1234567890abcdefABCDEF", "[0-9a-fA-F+]"));
+tassert(str.match("create", "(run|build|create|clean)"));
+
+
+// Works with slices
+str_s src = str$s("my_test __String.txt");
+tassert(str.slice.match(src, "*"));
+tassert(str.slice.match(src, "*.txt*"));
+tassert(str.slice.match(src, "my_test*.txt"));
+
+```
+
+*/
+
+struct __cex_namespace__str
+{
     // Autogenerated by CEX
     // clang-format off
 
+    /// Clones string using allocator, null tolerant, returns NULL on error.
     char*           (*clone)(char* s, IAllocator allc);
+    /// Makes a copy of initial `src`, into `dest` buffer constrained by `destlen`. NULL tolerant,
+    /// always null-terminated, overflow checked.
     Exception       (*copy)(char* dest, char* src, usize destlen);
+    /// Checks if string ends with prefix, returns false on error, NULL tolerant
     bool            (*ends_with)(char* s, char* suffix);
+    /// Compares two null-terminated strings (null tolerant)
     bool            (*eq)(char* a, char* b);
+    /// Compares two strings, case insensitive, null tolerant
     bool            (*eqi)(char* a, char* b);
+    /// Find a substring in a string, returns pointer to first element. NULL tolerant, and NULL on err.
     char*           (*find)(char* haystack, char* needle);
+    /// Find substring from the end , NULL tolerant, returns NULL on error.
     char*           (*findr)(char* haystack, char* needle);
+    /// Formats string and allocates it dynamically using allocator, supports CEX format engine
     char*           (*fmt)(IAllocator allc, char* format,...);
+    /// Joins string using a separator (join_by), NULL tolerant, returns NULL on error.
     char*           (*join)(char** str_arr, usize str_arr_len, char* join_by, IAllocator allc);
+    /// Calculates string length, NULL tolerant.
     usize           (*len)(char* s);
+    /// Returns new lower case string, returns NULL on error, null tolerant
     char*           (*lower)(char* s, IAllocator allc);
+    /// String pattern matching check (see ./cex help str$ for examples)
     bool            (*match)(char* s, char* pattern);
+    /// libc `qsort()` comparator functions, for arrays of `char*`, sorting alphabetical
     int             (*qscmp)(const void* a, const void* b);
+    /// libc `qsort()` comparator functions, for arrays of `char*`, sorting alphabetical case insensitive
     int             (*qscmpi)(const void* a, const void* b);
+    /// Replaces substring occurrence in a string
     char*           (*replace)(char* s, char* old_sub, char* new_sub, IAllocator allc);
+    /// Creates string slice from a buf+len
     str_s           (*sbuf)(char* s, usize length);
+    /// Splits string using split_by (allows many) chars, returns new dynamic array of split char*
+    /// tokens, allocates memory with allc, returns NULL on error. NULL tolerant. Items of array are
+    /// cloned, so you need free them independently or better use arena or tmem$.
     arr$(char*)     (*split)(char* s, char* split_by, IAllocator allc);
+    /// Splits string by lines, result allocated by allc, as dynamic array of cloned lines, Returns NULL
+    /// on error, NULL tolerant. Items of array are cloned, so you need free them independently or
+    /// better use arena or tmem$. Supports \n or \r\n.
     arr$(char*)     (*split_lines)(char* s, IAllocator allc);
+    /// Analog of sprintf() uses CEX sprintf engine. NULL tolerant, overflow safe.
     Exc             (*sprintf)(char* dest, usize dest_len, char* format,...);
     /// Creates string slice of input C string (NULL tolerant, (str_s){0} on error)
     str_s           (*sstr)(char* ccharptr);
+    /// Checks if string starts with prefix, returns false on error, NULL tolerant
     bool            (*starts_with)(char* s, char* prefix);
+    /// Makes slices of `s` char* string, start/end are indexes, can be negative from the end, if end=0
+    /// mean full length of the string. `s` may be not null-terminated. function is NULL tolerant,
+    /// return (str_s){0} on error
     str_s           (*sub)(char* s, isize start, isize end);
+    /// Returns new upper case string, returns NULL on error, null tolerant
     char*           (*upper)(char* s, IAllocator allc);
+    /// Analog of vsprintf() uses CEX sprintf engine. NULL tolerant, overflow safe.
     Exception       (*vsprintf)(char* dest, usize dest_len, char* format, va_list va);
 
     struct {
@@ -1673,22 +2372,42 @@ struct __cex_namespace__str {
     } convert;
 
     struct {
+        /// Clone slice into new char* allocated by `allc`, null tolerant, returns NULL on error.
         char*           (*clone)(str_s s, IAllocator allc);
+        /// Makes a copy of initial `src` slice, into `dest` buffer constrained by `destlen`. NULL tolerant,
+        /// always null-terminated, overflow checked.
         Exception       (*copy)(char* dest, str_s src, usize destlen);
+        /// Checks if slice ends with prefix, returns (str_s){0} on error, NULL tolerant
         bool            (*ends_with)(str_s s, str_s suffix);
+        /// Compares two string slices, null tolerant
         bool            (*eq)(str_s a, str_s b);
+        /// Compares two string slices, null tolerant, case insensitive
         bool            (*eqi)(str_s a, str_s b);
+        /// Get index of first occurrence of `needle`, returns -1 on error.
         isize           (*index_of)(str_s s, str_s needle);
+        /// iterator over slice splits:  for$iter (str_s, it, str.slice.iter_split(s, ",", &it.iterator)) {}
         str_s           (*iter_split)(str_s s, char* split_by, cex_iterator_s* iterator);
+        /// Removes white spaces from the beginning of slice
         str_s           (*lstrip)(str_s s);
+        /// Slice pattern matching check (see ./cex help str$ for examples)
         bool            (*match)(str_s s, char* pattern);
+        /// libc `qsort()` comparator function for alphabetical sorting of str_s arrays
         int             (*qscmp)(const void* a, const void* b);
+        /// libc `qsort()` comparator function for alphabetical case insensitive sorting of str_s arrays
         int             (*qscmpi)(const void* a, const void* b);
+        /// Replaces slice prefix (start part), or returns the same slice if it's not found
         str_s           (*remove_prefix)(str_s s, str_s prefix);
+        /// Replaces slice suffix (end part), or returns the same slice if it's not found
         str_s           (*remove_suffix)(str_s s, str_s suffix);
+        /// Removes white spaces from the end of slice
         str_s           (*rstrip)(str_s s);
+        /// Checks if slice starts with prefix, returns (str_s){0} on error, NULL tolerant
         bool            (*starts_with)(str_s s, str_s prefix);
+        /// Removes white spaces from both ends of slice
         str_s           (*strip)(str_s s);
+        /// Makes slices of `s` slice, start/end are indexes, can be negative from the end, if end=0 mean
+        /// full length of the string. `s` may be not null-terminated. function is NULL tolerant, return
+        /// (str_s){0} on error
         str_s           (*sub)(str_s s, isize start, isize end);
     } slice;
 
@@ -1698,10 +2417,10 @@ CEX_NAMESPACE struct __cex_namespace__str str;
 
 
 
-
 /*
 *                          src/sbuf.h
 */
+#include <assert.h>
 
 typedef char* sbuf_c;
 
@@ -1713,32 +2432,102 @@ typedef struct
         u32 elsize : 8;   // maybe multibyte strings in the future?
         u32 nullterm : 8; // always zero to prevent usage of direct buffer
     } header;
-    u32 length;
-    u32 capacity;
+    Exc err;
     const Allocator_i* allocator;
+    usize capacity;
+    usize length;
 } __attribute__((packed)) sbuf_head_s;
 
-_Static_assert(alignof(sbuf_head_s) == 1, "align");
-_Static_assert(alignof(sbuf_head_s) == alignof(char), "align");
+static_assert(alignof(sbuf_head_s) == 1, "align");
+static_assert(alignof(sbuf_head_s) == alignof(char), "align");
+//static_assert(sizeof(sbuf_head_s) == 36, "size");
+/**
 
+Dynamic string builder class
+
+Key features:
+
+- Dynamically grown strings 
+- Supports CEX specific formats 
+- Can be backed by allocator or static buffer
+- Error resilient - allows self as NULL
+- `sbuf_c` - is an alias of `char*`, always null terminated, compatible with any C strings 
+
+- Allocator driven dynamic string
+```c
+sbuf_c s = sbuf.create(20, mem$);
+
+// These may fail (you may use them with e$* checks or add final check)
+sbuf.appendf(&s, "%s, CEX slice: %S\n", "456", str$s("slice"));
+sbuf.append(&s, "some string");
+
+e$except(err, sbuf.validate(&s)) {
+    // Error handling
+}
+
+if (!sbuf.isvalid(&s)) {
+    // Error, just a boolean flag
+}
+
+// Some other stuff
+s[i]   // getting i-th character of string
+strlen(s); // C strings work, because sbuf_c is vanilla char*
+sbuf.len(&s); // faster way of getting length (uses metadata)
+sbuf.grow(&s, new_capacity); // increase capacity
+sbuf.capacity(&s); // current capacity, 0 if error occurred
+sbuf.clear(&s); // reset dynamic string + null term
+
+
+
+
+// Frees the memory and sets s to NULL
+sbuf.destroy(&s);
+```
+
+- Static buffer backed string
+```c
+
+// NOTE: `s` address is different, because `buf` will contain header and metadata, use only `s`
+char buf[64];
+sbuf_c s = sbuf.create_static(buf, arr$len(buf));
+
+// You may check every operation if needed, but this more verbose
+e$ret(sbuf.appendf(&s, "%s, CEX slice: %S\n", "456", str$s("slice")));
+e$ret(sbuf.append(&s, "some string"));
+
+// It's not mandatory, but will clean up buffer data at the end
+sbuf.destroy(&s);
+```
+
+*/
 struct __cex_namespace__sbuf {
     // Autogenerated by CEX
     // clang-format off
 
-    Exception       (*append)(sbuf_c* self, char* s);
-    Exception       (*appendf)(sbuf_c* self, char* format,...);
-    Exception       (*appendfva)(sbuf_c* self, char* format, va_list va);
+    /// Append string to the builder
+    Exc             (*append)(sbuf_c* self, char* s);
+    /// Append format (using CEX formatting engine)
+    Exc             (*appendf)(sbuf_c* self, char* format,...);
+    /// Append format va (using CEX formatting engine), always null-terminating
+    Exc             (*appendfva)(sbuf_c* self, char* format, va_list va);
+    /// Returns string capacity from its metadata
     u32             (*capacity)(sbuf_c* self);
+    /// Clears string
     void            (*clear)(sbuf_c* self);
-    sbuf_c          (*create)(u32 capacity, IAllocator allocator);
+    /// Creates new dynamic string builder backed by allocator
+    sbuf_c          (*create)(usize capacity, IAllocator allocator);
+    /// Creates dynamic string backed by static array
     sbuf_c          (*create_static)(char* buf, usize buf_size);
-    sbuf_c          (*create_temp)(void);
+    /// Destroys the string, deallocates the memory, or nullify static buffer.
     sbuf_c          (*destroy)(sbuf_c* self);
-    Exception       (*grow)(sbuf_c* self, u32 new_capacity);
+    /// Returns false if string invalid
     bool            (*isvalid)(sbuf_c* self);
+    /// Returns string length from its metadata
     u32             (*len)(sbuf_c* self);
-    void            (*shrink)(sbuf_c* self, u32 new_length);
-    void            (*update_len)(sbuf_c* self);
+    /// Shrinks string length to new_length
+    Exc             (*shrink)(sbuf_c* self, usize new_length);
+    /// Validate dynamic string state, with detailed Exception
+    Exception       (*validate)(sbuf_c* self);
 
     // clang-format on
 };
@@ -1751,32 +2540,165 @@ CEX_NAMESPACE struct __cex_namespace__sbuf sbuf;
 *                          src/io.h
 */
 
+/// Makes string literal with ansi colored test
 #define io$ansi(text, ansi_col) "\033[" ansi_col "m" text "\033[0m"
 
+/**
+Cross-platform IO namespace
+
+- Read all file content (low level api)
+```c
+
+test$case(test_readall)
+{
+    // Open new file
+    FILE* file;
+    e$ret(io.fopen(&file, "tests/data/text_file_50b.txt", "r"));
+
+
+    // get file size 
+    tassert_eq(50, io.file.size(file));
+
+    // Read all content
+    str_s content;
+    e$ret(io.fread_all(file, &content, mem$));
+    mem$free(mem$, content.buf); // content.buf is allocated by mem$ !
+
+    // Cleanup
+    io.fclose(&file); // file will be set to NULL
+    tassert(file == NULL);
+
+    return EOK;
+}
+
+```
+
+- File load/save (easy api)
+```c
+
+test$case(test_fload_save)
+{
+    tassert_eq(Error.ok, io.file.save("tests/data/text_file_write.txt", "Hello from CEX!\n"));
+    char* content = io.file.load("tests/data/text_file_write.txt", mem$);
+    tassert(content);
+    tassert_eq(content, "Hello from CEX!\n");
+    mem$free(mem$, content);
+    return EOK;
+}
+
+```
+
+- File read/write lines 
+
+```c
+test$case(test_write_line)
+{
+    FILE* file;
+    tassert_eq(Error.ok, io.fopen(&file, "tests/data/text_file_write.txt", "w+"));
+
+    str_s content;
+    mem$scope(tmem$, _)
+    {
+        // Writing line by line
+        tassert_eq(EOK, io.file.writeln(file, "hello"));
+        tassert_eq(EOK, io.file.writeln(file, "world"));
+
+        // Reading line by line
+        io.rewind(file);
+
+        // easy api - backed by temp allocator
+        tassert_eq("hello", io.file.readln(file, _));
+
+        // low-level api (using heap allocator, needs free!)
+        tassert_er(EOK, io.fread_line(file, &content, mem$));
+        tassert(str.slice.eq(content, str$s("world")));
+        mem$free(mem$, content.buf);
+    }
+
+    io.fclose(&file);
+    return EOK;
+}
+```
+
+- File low-level write/read
+```c
+
+test$case(test_read_loop)
+{
+    FILE* file;
+    tassert_eq(Error.ok, io.fopen(&file, "tests/data/text_file_50b.txt", "r+"));
+
+    char buf[128] = {0};
+
+    // Read bytes
+    isize nread = 0;
+    while((nread = io.fread(file, buf, 10))) {
+        if (nread < 0) {
+            // TODO: io.fread() error occured, you should handle it here
+            // NOTE: you can use os.get_last_error() for Exception representation of io.fread() err
+            break;
+        }
+        
+        tassert_eq(nread, 10);
+        buf[10] = '\0';
+        io.printf("%s", buf);
+    }
+
+    // Write bytes
+    char buf2[] = "foobar";
+    tassert_ne(EOK, io.fwrite(file, buf2, arr$len(buf2)));
+
+    io.fclose(&file);
+    return EOK;
+}
+
+```
+
+*/
 struct __cex_namespace__io {
     // Autogenerated by CEX
     // clang-format off
 
+    /// Closes file and set it to NULL.
     void            (*fclose)(FILE** file);
+    /// Flush changes to file
     Exception       (*fflush)(FILE* file);
+    /// Obtain file descriptor from FILE*
     int             (*fileno)(FILE* file);
+    /// Opens new file: io.fopen(&file, "file.txt", "r+")
     Exception       (*fopen)(FILE** file, char* filename, char* mode);
+    /// Prints formatted string to the file. Uses CEX printf() engine with special formatting.
     Exc             (*fprintf)(FILE* stream, char* format,...);
-    Exception       (*fread)(FILE* file, void* obj_buffer, usize obj_el_size, usize* obj_count);
+    /// Read file contents into the buf, return nbytes read (can be < buff_len), 0 on EOF, negative on
+    /// error (you may use os.get_last_error() for getting Exception for error, cross-platform )
+    isize           (*fread)(FILE* file, void* buff, usize buff_len);
+    /// Read all contents of the file, using allocator. You should free `s.buf` after.
     Exception       (*fread_all)(FILE* file, str_s* s, IAllocator allc);
+    /// Reads line from a file into str_s buffer, allocates memory. You should free `s.buf` after.
     Exception       (*fread_line)(FILE* file, str_s* s, IAllocator allc);
+    /// Seek file position
     Exception       (*fseek)(FILE* file, long offset, int whence);
+    /// Returns current cursor position into `size` pointer
     Exception       (*ftell)(FILE* file, usize* size);
-    Exception       (*fwrite)(FILE* file, void* obj_buffer, usize obj_el_size, usize obj_count);
+    /// Writes bytes to the file
+    Exception       (*fwrite)(FILE* file, void* buff, usize buff_len);
+    /// Check if current file supports ANSI colors and in interactive terminal mode
     bool            (*isatty)(FILE* file);
+    /// Prints formatted string to stdout. Uses CEX printf() engine with special formatting.
     int             (*printf)(char* format,...);
+    /// Rewind file cursor at the beginning
     void            (*rewind)(FILE* file);
 
     struct {
+        /// Load full contents of the file at `path`, using text mode. Returns NULL on error.
         char*           (*load)(char* path, IAllocator allc);
+        /// Reads line from file, allocates result. Returns NULL on error.
         char*           (*readln)(FILE* file, IAllocator allc);
+        /// Saves full `contents` in the file at `path`, using text mode.
         Exception       (*save)(char* path, char* contents);
+        /// Return full file size, always 0 for NULL file or atty
         usize           (*size)(FILE* file);
+        /// Writes new line to the file
         Exception       (*writeln)(FILE* file, char* line);
     } file;
 
@@ -1802,6 +2724,7 @@ typedef Exception (*argparse_callback_f)(
 typedef Exception (*argparse_convert_f)(char* s, void* out_val);
 typedef Exception (*argparse_command_f)(int argc, char** argv, void* user_ctx);
 
+/// command line options type (prefer macros)
 typedef struct argparse_opt_s
 {
     u8 type;
@@ -1816,6 +2739,7 @@ typedef struct argparse_opt_s
     bool is_present; // also setting in in argparse$opt* macro, allows optional parameter sugar
 } argparse_opt_s;
 
+/// command settings type (prefer macros)
 typedef struct argparse_cmd_s
 {
     char* name;
@@ -1843,9 +2767,7 @@ enum CexArgParseType_e
     CexArgParseType__generic,
 };
 
-/**
- * argpparse
- */
+/// main argparse struct (used as options config)
 typedef struct argparse_c
 {
     // user supplied options
@@ -1875,7 +2797,10 @@ typedef struct argparse_c
 } argparse_c;
 
 
-// built-in option macros
+/// holder for list of  argparse$opt()
+#define argparse$opt_list(...) .options = (argparse_opt_s[]) {__VA_ARGS__ {0} /* NULL TERM */}
+
+/// command line option record (generic type of arguments)
 #define argparse$opt(value, ...)                                                                   \
     ({                                                                                             \
         u32 val_type = _Generic(                                                                   \
@@ -1920,14 +2845,98 @@ typedef struct argparse_c
     })
 // clang-format off
 
-#define argparse$opt_list(...) .options = (argparse_opt_s[]) {__VA_ARGS__ {0} /* NULL TERM */}
+
+/// holder for list of 
+#define argparse$cmd_list(...) .commands = (argparse_cmd_s[]) {__VA_ARGS__ {0} /* NULL TERM */}
+
+/// options group separator
 #define argparse$opt_group(h)     { CexArgParseType__group, NULL, '\0', NULL, h, false, NULL, 0, 0, .is_present=0 }
+
+/// built-in option for -h,--help
 #define argparse$opt_help()       {CexArgParseType__boolean, NULL, 'h', "help",                           \
                                         "show this help message and exit", false,    \
                                         NULL, 0, .is_present = 0}
-#define argparse$pop(argc, argv) ((argc > 0) ? (--argc, (*argv)++) : NULL)
-#define argparse$cmd_list(...) .commands = (argparse_cmd_s[]) {__VA_ARGS__ {0} /* NULL TERM */}
 
+
+/**
+
+* Command line args parsing
+
+```c
+// NOTE: Command example 
+
+Exception cmd_build_docs(int argc, char** argv, void* user_ctx);
+
+int
+main(int argc, char** argv)
+{
+    // clang-format off
+    argparse_c args = {
+        .description = "My description",
+        .usage = "Usage help",
+        .epilog = "Epilog text",
+        argparse$cmd_list(
+            { .name = "build-docs", .func = cmd_build_docs, .help = "Build CEX documentation" },
+        ),
+    };
+    if (argparse.parse(&args, argc, argv)) { return 1; }
+    if (argparse.run_command(&args, NULL)) { return 1; }
+    return 0;
+}
+
+Exception
+cmd_build_docs(int argc, char** argv, void* user_ctx)
+{
+    // Command handling func
+}
+
+```
+
+* Parsing custom arguments
+
+```c
+// Simple options example
+
+int
+main(int argc, char** argv)
+{
+    bool force = 0;
+    bool test = 0;
+    int int_num = 0;
+    float flt_num = 0.f;
+    char* path = NULL;
+
+    char* usage = "basic [options] [[--] args]\n"
+                  "basic [options]\n";
+
+    argparse_c argparse = {
+        argparse$opt_list(
+            argparse$opt_help(),
+            argparse$opt_group("Basic options"),
+            argparse$opt(&force, 'f', "force", "force to do"),
+            argparse$opt(&test, 't', "test", .help = "test only"),
+            argparse$opt(&path, 'p', "path", "path to read", .required = true),
+            argparse$opt_group("Another group"),
+            argparse$opt(&int_num, 'i', "int", "selected integer"),
+            argparse$opt(&flt_num, 's', "float", "selected float"),
+        ),
+        // NOTE: usage/description are optional 
+
+        .usage = usage,
+        .description = "\nA brief description of what the program does and how it works.",
+        "\nAdditional description of the program after the description of the arguments.",
+    };
+    if (argparse.parse(&args, argc, argv)) { return 1; }
+
+    // NOTE: all args are filled and parsed after this line
+
+    return 0;
+}
+
+```
+
+
+*/
 struct __cex_namespace__argparse {
     // Autogenerated by CEX
     // clang-format off
@@ -2375,6 +3384,7 @@ struct subprocess_s {
 *                          src/os.h
 */
 
+/// Additional flags for os.cmd.create()
 typedef struct os_cmd_flags_s
 {
     u32 combine_stdouterr : 1; // if 1 - combines output from stderr to stdout
@@ -2382,8 +3392,9 @@ typedef struct os_cmd_flags_s
     u32 no_search_path : 1;    // if 1 - disables propagating PATH= env to command line
     u32 no_window : 1;         // if 1 - disables creation of new window if OS supported
 } os_cmd_flags_s;
-_Static_assert(sizeof(os_cmd_flags_s) == sizeof(u32), "size?");
+static_assert(sizeof(os_cmd_flags_s) == sizeof(u32), "size?");
 
+/// Command container (current state of subprocess)
 typedef struct os_cmd_c
 {
     struct subprocess_s _subpr;
@@ -2391,6 +3402,7 @@ typedef struct os_cmd_c
     bool _is_subprocess;
 } os_cmd_c;
 
+/// File stats metadata (cross-platform), returned by os.fs.stats
 typedef struct os_fs_stat_s
 {
     u64 is_valid : 1;
@@ -2405,7 +3417,7 @@ typedef struct os_fs_stat_s
         time_t mtime;
     };
 } os_fs_stat_s;
-_Static_assert(sizeof(os_fs_stat_s) <= sizeof(u64) * 2, "size?");
+static_assert(sizeof(os_fs_stat_s) <= sizeof(u64) * 2, "size?");
 
 typedef Exception os_fs_dir_walk_f(char* path, os_fs_stat_s ftype, void* user_ctx);
 
@@ -2460,6 +3472,7 @@ __attribute__((unused)) static const char* OSArch_str[] = {
 };
 
 #ifdef _WIN32
+/// OS path separator, generally '\' for Windows, '/' otherwise
 #    define os$PATH_SEP '\\'
 #else
 #    define os$PATH_SEP '/'
@@ -2486,10 +3499,12 @@ __attribute__((unused)) static const char* OSArch_str[] = {
 #    define _os$args_print(msg, args, args_len)
 #endif
 
+/// Run command by dynamic or static array (returns Exc, but error check is not mandatory). Pipes
+/// all IO to stdout/err/in into current terminal, feels totally interactive.
 #define os$cmda(args, args_len...)                                                                 \
     ({                                                                                             \
         /* NOLINTBEGIN */                                                                          \
-        _Static_assert(sizeof(args) > 0, "You must pass at least one item");                       \
+        static_assert(sizeof(args) > 0, "You must pass at least one item");                        \
         usize _args_len_va[] = { args_len };                                                       \
         (void)_args_len_va;                                                                        \
         usize _args_len = (sizeof(_args_len_va) > 0) ? _args_len_va[0] : arr$len(args);            \
@@ -2502,6 +3517,9 @@ __attribute__((unused)) static const char* OSArch_str[] = {
         /* NOLINTEND */                                                                            \
     })
 
+/// Run command by arbitrary set of arguments (returns Exc, but error check is not mandatory). Pipes
+/// all IO to stdout/err/in into current terminal, feels totally interactive. 
+/// Example: e$ret(os$cmd("cat", "./cex.c"))
 #define os$cmd(args...)                                                                            \
     ({                                                                                             \
         char* _args[] = { args, NULL };                                                            \
@@ -2509,6 +3527,7 @@ __attribute__((unused)) static const char* OSArch_str[] = {
         os$cmda(_args, _args_len);                                                                 \
     })
 
+/// Path parts join by variable set of args: os$path_join(mem$, "foo", "bar", "cex.c")
 #define os$path_join(allocator, path_parts...)                                                     \
     ({                                                                                             \
         char* _args[] = { path_parts };                                                            \
@@ -2516,65 +3535,216 @@ __attribute__((unused)) static const char* OSArch_str[] = {
         os.path.join(_args, _args_len, allocator);                                                 \
     })
 
+/**
+
+Cross-platform OS related operations:
+
+- `os.cmd.` - for running commands and interacting with them
+- `os.fs.` - file-system related tasks
+- `os.env.` - getting setting environment variable
+- `os.path.` - file path operations
+- `os.platform.` - information about current platform
+
+
+Examples:
+
+- Running simple commands
+```c
+// NOTE: there are many operation with os-related stuff in cexy build system
+// try to play in example roulette:  ./cex help --example os.cmd.run
+
+// Easy macro, run fixed number of arguments
+
+e$ret(os$cmd(
+    cexy$cc,
+    "src/main.c",
+    cexy$build_dir "/sqlite3.o",
+    cexy$cc_include,
+    "-lpthread",
+    "-lm",
+    "-o",
+    cexy$build_dir "/hello_sqlite"
+));
+
+
+```
+
+- Running dynamic arguments
+```c
+mem$scope(tmem$, _)
+{
+        arr$(char*) args = arr$new(args, _);
+        arr$pushm(
+            args,
+            cexy$cc,
+            "-Wall",
+            "-Werror",
+        );
+
+        if (os.platform.current() == OSPlatform__win) {
+            arr$pushm(args, "-lbcrypt");
+        }
+
+        arr$pushm(args, NULL); // NOTE: last element must be NULL
+        e$ret(os$cmda(args));
+    }
+}
+```
+
+- Getting command output (low level api)
+```c
+
+test$case(os_cmd_create)
+{
+    os_cmd_c c = { 0 };
+    mem$scope(tmem$, _)
+    {
+        char* args[] = { "./cex", NULL };
+        tassert_er(EOK, os.cmd.create(&c, args, arr$len(args), NULL));
+
+        char* output = os.cmd.read_all(&c, _);
+        tassert(output != NULL);
+        io.printf("%s\n", output);
+
+        int err_code = 0;
+        tassert_er(Error.runtime, os.cmd.join(&c, 0, &err_code));
+        tassert_eq(err_code, 1);
+    }
+    return EOK;
+}
+```
+
+- Working with files
+```c
+
+test$case(test_os_find_all_c_files)
+{
+    mem$scope(tmem$, _)
+    {
+        // Check if exists and remove
+        if (os.path.exists("./cex")) { e$ret(os.fs.remove("./cex")); }
+
+        // illustration of path combining
+        char* pattern = os$path_join(_, "./", "*.c");
+
+        // find all matching *.c files
+        for$each (it, os.fs.find(pattern, _), false , _)) {
+            log$debug("found file: %s\n", it);
+        }
+    }
+
+    return EOK;
+}
+```
+
+
+*/
 struct __cex_namespace__os
 {
     // Autogenerated by CEX
     // clang-format off
 
+    /// Get last system API error as string representation (Exception compatible). Result content may be
+    /// affected by OS locale settings.
     Exc             (*get_last_error)(void);
+    /// Sleep for `period_millisec` duration
     void            (*sleep)(u32 period_millisec);
-    f64             (*timer)();
+    /// Get high performance monotonic timer value in seconds
+    f64             (*timer)(void);
 
     struct {
+        /// Creates new os command (use os$cmd() and os$cmd() for easy cases)
         Exception       (*create)(os_cmd_c* self, char** args, usize args_len, os_cmd_flags_s* flags);
+        /// Check if `cmd_exe` program name exists in PATH. cmd_exe can be absolute, or simple command name,
+        /// e.g. `cat`
         bool            (*exists)(char* cmd_exe);
+        /// Get running command stderr stream
         FILE*           (*fstderr)(os_cmd_c* self);
+        /// Get running command stdin stream
         FILE*           (*fstdin)(os_cmd_c* self);
+        /// Get running command stdout stream
         FILE*           (*fstdout)(os_cmd_c* self);
+        /// Checks if process is running
         bool            (*is_alive)(os_cmd_c* self);
+        /// Waits process to end, and get `out_ret_code`, if timeout_sec=0 - infinite wait, raises
+        /// Error.runtime if out_ret_code != 0
         Exception       (*join)(os_cmd_c* self, u32 timeout_sec, i32* out_ret_code);
+        /// Terminates the running process
         Exception       (*kill)(os_cmd_c* self);
+        /// Read all output from process stdout, NULL if stdout is not available
         char*           (*read_all)(os_cmd_c* self, IAllocator allc);
+        /// Read line from process stdout, NULL if stdout is not available
         char*           (*read_line)(os_cmd_c* self, IAllocator allc);
+        /// Run command using arguments array and resulting os_cmd_c
         Exception       (*run)(char** args, usize args_len, os_cmd_c* out_cmd);
+        /// Writes line to the process stdin
         Exception       (*write_line)(os_cmd_c* self, char* line);
     } cmd;
 
     struct {
+        /// Get environment variable, with `deflt` if not found
         char*           (*get)(char* name, char* deflt);
+        /// Set environment variable
         Exception       (*set)(char* name, char* value);
     } env;
 
     struct {
+        /// Change current working directory
         Exception       (*chdir)(char* path);
+        /// Copy file
         Exception       (*copy)(char* src_path, char* dst_path);
+        /// Copy directory recursively
         Exception       (*copy_tree)(char* src_dir, char* dst_dir);
+        /// Iterates over directory (can be recursive) using callback function
         Exception       (*dir_walk)(char* path, bool is_recursive, os_fs_dir_walk_f callback_fn, void* user_ctx);
-        arr$(char*)     (*find)(char* path, bool is_recursive, IAllocator allc);
+        /// Finds files in `dir/pattern`, for example "./mydir/*.c" (all c files), if is_recursive=true, all
+        /// *.c files found in sub-directories.
+        arr$(char*)     (*find)(char* path_pattern, bool is_recursive, IAllocator allc);
+        /// Get current working directory
         char*           (*getcwd)(IAllocator allc);
+        /// Makes directory (no error if exists)
         Exception       (*mkdir)(char* path);
+        /// Makes all directories in a path
         Exception       (*mkpath)(char* path);
+        /// Removes file or empty directory (also see os.fs.remove_tree)
         Exception       (*remove)(char* path);
+        /// Removes directory and all its contents recursively
         Exception       (*remove_tree)(char* path);
+        /// Renames file or directory
         Exception       (*rename)(char* old_path, char* new_path);
+        /// Returns cross-platform path stats information (see os_fs_stat_s)
         os_fs_stat_s    (*stat)(char* path);
     } fs;
 
     struct {
+        /// Returns absolute path from relative
         char*           (*abs)(char* path, IAllocator allc);
+        /// Get file name of a path
         char*           (*basename)(char* path, IAllocator allc);
+        /// Get directory name of a path
         char*           (*dirname)(char* path, IAllocator allc);
+        /// Check if file/directory path exists
         bool            (*exists)(char* file_path);
+        /// Join path with OS specific path separator
         char*           (*join)(char** parts, u32 parts_len, IAllocator allc);
+        /// Splits path by `dir` and `file` parts, when return_dir=true - returns `dir` part, otherwise
+        /// `file` part
         str_s           (*split)(char* path, bool return_dir);
     } path;
 
     struct {
+        /// Returns OSArch from string
         OSArch_e        (*arch_from_str)(char* name);
+        /// Converts arch to string
         char*           (*arch_to_str)(OSArch_e platform);
+        /// Returns current OS platform, returns enum of OSPlatform__*, e.g. OSPlatform__win,
+        /// OSPlatform__linux, OSPlatform__macos, etc..
         OSPlatform_e    (*current)(void);
+        /// Returns string name of current platform
         char*           (*current_str)(void);
+        /// Converts platform name to enum
         OSPlatform_e    (*from_str)(char* name);
+        /// Converts platform enum to name
         char*           (*to_str)(OSPlatform_e platform);
     } platform;
 
@@ -2620,10 +3790,97 @@ struct _cex_test_context_s
     char str_buf[CEX_TEST_AMSG_MAX_LEN];
 };
 
+/**
+
+Unit Testing engine:
+
+- Running/building tests
+```sh
+./cex test create tests/test_mytest.c
+./cex test run tests/test_mytest.c
+./cex test run all
+./cex test debug tests/test_mytest.c
+./cex test clean all
+./cex test --help
+```
+
+- Unit Test structure
+```c
+test$setup_case() {
+    // Optional: runs before each test case
+    return EOK;
+}
+test$teardown_case() {
+    // Optional: runs after each test case
+    return EOK;
+}
+test$setup_suite() {
+    // Optional: runs once before full test suite initialized
+    return EOK;
+}
+test$teardown_suite() {
+    // Optional: runs once after full test suite ended
+    return EOK;
+}
+
+test$case(my_test_case){
+    e$ret(foo("raise")); // this test will fail if `foo()` raises Exception 
+    return EOK; // Must return EOK for passed
+}
+
+test$case(my_test_another_case){
+    tassert_eq(1, 0); //  tassert_ fails test, but not abort the program
+    return EOK; // Must return EOK for passed
+}
+
+test$main(); // mandatory at the end of each test
+```
+
+- Test checks
+```c
+
+test$case(my_test_case){
+    // Generic type assertions, fails and print values of both arguments
+
+    tassert_eq(1, 1);
+    tassert_eq(str, "foo");
+    tassert_eq(num, 3.14);
+    tassert_eq(str_slice, str$s("expected") );
+
+    tassert(condition && "oops");
+    tassertf(condition, "oops: %s", s);
+
+    tassert_er(EOK, raising_exc_foo(0));
+    tassert_er(Error.argument, raising_exc_foo(-1));
+
+    tassert_eq_almost(PI, 3.14, 0.01); // 0.01 is float tolerance
+    tassert_eq(3.4 * NAN, NAN); // NAN equality also works
+
+    tassert_eq_ptr(a, b); // raw pointer comparison
+    tassert_eq_mem(a, b); // raw buffer content comparison (a and b expected to be same size)
+
+    tassert_eq_arr(a, b); // compare two arrays (static or dynamic)
+
+
+    tassert_ne(1, 0); // not equal
+    tassert_le(a, b); // a <= b
+    tassert_lt(a, b); // a < b
+    tassert_gt(a, b); // a > b
+    tassert_ge(a, b); // a >= b
+
+    return EOK;
+}
+
+```
+
+*/
+#define __test$
+
 #if defined(__clang__)
-#    define test$NOOPT __attribute__((optnone))
+/// Attribute for function which disables optimization for test cases or other functions
+#    define test$noopt __attribute__((optnone))
 #elif defined(__GNUC__) || defined(__GNUG__)
-#    define test$NOOPT __attribute__((optimize("O0")))
+#    define test$noopt __attribute__((optimize("O0")))
 #elif defined(_MSC_VER)
 #    error "MSVC deprecated"
 #endif
@@ -2638,6 +3895,7 @@ struct _cex_test_context_s
     })
 
 
+/// Unit-test test case
 #define test$case(NAME)                                                                             \
     extern struct _cex_test_context_s _cex_test__mainfn_state;                                      \
     static Exception cex_test_##NAME();                                                             \
@@ -2655,36 +3913,44 @@ struct _cex_test_context_s
                                        .test_line = __LINE__ }                                      \
         );                                                                                          \
     }                                                                                               \
-    Exception test$NOOPT cex_test_##NAME(void)
+    Exception test$noopt cex_test_##NAME(void)
 
 
 #ifndef CEX_TEST
-#    define test$env_check()                                                                       \
+#    define _test$env_check()                                                                       \
         fprintf(stderr, "CEX_TEST was not defined, pass -DCEX_TEST or #define CEX_TEST");          \
         exit(1);
 #else
-#    define test$env_check() (void)0
+#    define _test$env_check() (void)0
 #endif
 
+#ifdef _WIN32
+#    define _cex_test_file_close$ _close
+#else
+#    define _cex_test_file_close$ close
+#endif
+
+/// main() function for test suite, you must place it into test file at the end 
 #define test$main()                                                                                \
     _Pragma("GCC diagnostic push"); /* Mingw64:  warning: visibility attribute not supported */    \
     _Pragma("GCC diagnostic ignored \"-Wattributes\"");                                            \
     struct _cex_test_context_s _cex_test__mainfn_state = { .suite_file = __FILE__ };               \
     int main(int argc, char** argv)                                                                \
     {                                                                                              \
-        test$env_check();                                                                          \
+        _test$env_check();                                                                          \
         argv[0] = __FILE__;                                                                        \
         int ret_code = cex_test_main_fn(argc, argv);                                               \
         if (_cex_test__mainfn_state.test_cases) { arr$free(_cex_test__mainfn_state.test_cases); }  \
         if (_cex_test__mainfn_state.orig_stdout_fd) {                                              \
-            close(_cex_test__mainfn_state.orig_stdout_fd);                                         \
+            _cex_test_file_close$(_cex_test__mainfn_state.orig_stdout_fd);                         \
         }                                                                                          \
         if (_cex_test__mainfn_state.orig_stderr_fd) {                                              \
-            close(_cex_test__mainfn_state.orig_stderr_fd);                                         \
+            _cex_test_file_close$(_cex_test__mainfn_state.orig_stderr_fd);                         \
         }                                                                                          \
         return ret_code;                                                                           \
     }
 
+/// Optional: initializes at test suite once at start
 #define test$setup_suite()                                                                         \
     extern struct _cex_test_context_s _cex_test__mainfn_state;                                     \
     static Exception cex_test__setup_suite_fn();                                                   \
@@ -2694,8 +3960,9 @@ struct _cex_test_context_s
         uassert(_cex_test__mainfn_state.setup_suite_fn == NULL);                                   \
         _cex_test__mainfn_state.setup_suite_fn = &cex_test__setup_suite_fn;                        \
     }                                                                                              \
-    Exception test$NOOPT cex_test__setup_suite_fn(void)
+    Exception test$noopt cex_test__setup_suite_fn(void)
 
+/// Optional: shut down test suite once at the end
 #define test$teardown_suite()                                                                      \
     extern struct _cex_test_context_s _cex_test__mainfn_state;                                     \
     static Exception cex_test__teardown_suite_fn();                                                \
@@ -2705,8 +3972,9 @@ struct _cex_test_context_s
         uassert(_cex_test__mainfn_state.teardown_suite_fn == NULL);                                \
         _cex_test__mainfn_state.teardown_suite_fn = &cex_test__teardown_suite_fn;                  \
     }                                                                                              \
-    Exception test$NOOPT cex_test__teardown_suite_fn(void)
+    Exception test$noopt cex_test__teardown_suite_fn(void)
 
+/// Optional: called before each test$case() starts
 #define test$setup_case()                                                                          \
     extern struct _cex_test_context_s _cex_test__mainfn_state;                                     \
     static Exception cex_test__setup_case_fn();                                                    \
@@ -2716,8 +3984,9 @@ struct _cex_test_context_s
         uassert(_cex_test__mainfn_state.setup_case_fn == NULL);                                    \
         _cex_test__mainfn_state.setup_case_fn = &cex_test__setup_case_fn;                          \
     }                                                                                              \
-    Exception test$NOOPT cex_test__setup_case_fn(void)
+    Exception test$noopt cex_test__setup_case_fn(void)
 
+/// Optional: called after each test$case() ends
 #define test$teardown_case()                                                                       \
     extern struct _cex_test_context_s _cex_test__mainfn_state;                                     \
     static Exception cex_test__teardown_case_fn();                                                 \
@@ -2727,7 +3996,7 @@ struct _cex_test_context_s
         uassert(_cex_test__mainfn_state.teardown_case_fn == NULL);                                 \
         _cex_test__mainfn_state.teardown_case_fn = &cex_test__teardown_case_fn;                    \
     }                                                                                              \
-    Exception test$NOOPT cex_test__teardown_case_fn(void)
+    Exception test$noopt cex_test__teardown_case_fn(void)
 
 #define _test$tassert_fn(a, b)                                                                     \
     ({                                                                                             \
@@ -2752,6 +4021,7 @@ struct _cex_test_context_s
         );                                                                                         \
     })
 
+/// Test assertion, fails test if A is false
 #define tassert(A)                                                                                 \
     ({ /* ONLY for test$case USE */                                                                \
        if (!(A)) {                                                                                 \
@@ -2760,6 +4030,7 @@ struct _cex_test_context_s
        }                                                                                           \
     })
 
+/// Test assertion with user formatted output, supports CEX formatting engine
 #define tassertf(A, M, ...)                                                                        \
     ({ /* ONLY for test$case USE */                                                                \
        if (!(A)) {                                                                                 \
@@ -2773,16 +4044,19 @@ struct _cex_test_context_s
            return _cex_test__mainfn_state.str_buf;                                                 \
        }                                                                                           \
     })
+
+/// Generic type equality checks, supports Exc, char*, str_s, numbers, floats (with NAN)
 #define tassert_eq(a, b)                                                                           \
     ({                                                                                             \
         Exc cex$tmpname(err) = NULL;                                                               \
-        var genf = _test$tassert_fn((a), (b));                                                     \
+        auto genf = _test$tassert_fn((a), (b));                                                    \
         if ((cex$tmpname(err) = genf((a), (b), __LINE__, _cex_test_eq_op__eq))) {                  \
             _test$tassert_breakpoint();                                                            \
             return cex$tmpname(err);                                                               \
         }                                                                                          \
     })
 
+/// Check expected error, or EOK (if no error expected)
 #define tassert_er(a, b)                                                                           \
     ({                                                                                             \
         Exc cex$tmpname(err) = NULL;                                                               \
@@ -2792,6 +4066,7 @@ struct _cex_test_context_s
         }                                                                                          \
     })
 
+/// Check floating point values absolute difference less than delta
 #define tassert_eq_almost(a, b, delta)                                                             \
     ({                                                                                             \
         Exc cex$tmpname(err) = NULL;                                                               \
@@ -2800,6 +4075,8 @@ struct _cex_test_context_s
             return cex$tmpname(err);                                                               \
         }                                                                                          \
     })
+
+/// Check pointer address equality
 #define tassert_eq_ptr(a, b)                                                                       \
     ({                                                                                             \
         Exc cex$tmpname(err) = NULL;                                                               \
@@ -2808,15 +4085,17 @@ struct _cex_test_context_s
             return cex$tmpname(err);                                                               \
         }                                                                                          \
     })
+
+/// Check memory buffer contents, binary equality, a and b must be the same sizeof()
 #define tassert_eq_mem(a, b...)                                                                    \
     ({                                                                                             \
-        var _a = (a);                                                                              \
-        var _b = (b);                                                                              \
-        _Static_assert(                                                                            \
+        auto _a = (a);                                                                             \
+        auto _b = (b);                                                                             \
+        static_assert(                                                                             \
             __builtin_types_compatible_p(__typeof__(_a), __typeof__(_b)),                          \
             "incompatible"                                                                         \
         );                                                                                         \
-        _Static_assert(sizeof(_a) == sizeof(_b), "different size");                                \
+        static_assert(sizeof(_a) == sizeof(_b), "different size");                                 \
         if (memcmp(&_a, &_b, sizeof(_a)) != 0) {                                                   \
             _test$tassert_breakpoint();                                                            \
             if (str.sprintf(                                                                       \
@@ -2828,15 +4107,16 @@ struct _cex_test_context_s
         }                                                                                          \
     })
 
+/// Check array element-wise equality (prints at what index is difference)
 #define tassert_eq_arr(a, b...)                                                                    \
     ({                                                                                             \
-        var _a = (a);                                                                              \
-        var _b = (b);                                                                              \
-        _Static_assert(                                                                            \
+        auto _a = (a);                                                                             \
+        auto _b = (b);                                                                             \
+        static_assert(                                                                             \
             __builtin_types_compatible_p(__typeof__(*a), __typeof__(*b)),                          \
             "incompatible"                                                                         \
         );                                                                                         \
-        _Static_assert(sizeof(*_a) == sizeof(*_b), "different size");                              \
+        static_assert(sizeof(*_a) == sizeof(*_b), "different size");                               \
         usize _alen = arr$len(a);                                                                  \
         usize _blen = arr$len(b);                                                                  \
         usize _itsize = sizeof(*_a);                                                               \
@@ -2866,50 +4146,55 @@ struct _cex_test_context_s
         }                                                                                          \
     })
 
+/// Check if a and b are not equal
 #define tassert_ne(a, b)                                                                           \
     ({                                                                                             \
         Exc cex$tmpname(err) = NULL;                                                               \
-        var genf = _test$tassert_fn((a), (b));                                                     \
+        auto genf = _test$tassert_fn((a), (b));                                                    \
         if ((cex$tmpname(err) = genf((a), (b), __LINE__, _cex_test_eq_op__ne))) {                  \
             _test$tassert_breakpoint();                                                            \
             return cex$tmpname(err);                                                               \
         }                                                                                          \
     })
 
+/// Check if a <= b
 #define tassert_le(a, b)                                                                           \
     ({                                                                                             \
         Exc cex$tmpname(err) = NULL;                                                               \
-        var genf = _test$tassert_fn((a), (b));                                                     \
+        auto genf = _test$tassert_fn((a), (b));                                                    \
         if ((cex$tmpname(err) = genf((a), (b), __LINE__, _cex_test_eq_op__le))) {                  \
             _test$tassert_breakpoint();                                                            \
             return cex$tmpname(err);                                                               \
         }                                                                                          \
     })
 
+/// Check if a < b
 #define tassert_lt(a, b)                                                                           \
     ({                                                                                             \
         Exc cex$tmpname(err) = NULL;                                                               \
-        var genf = _test$tassert_fn((a), (b));                                                     \
+        auto genf = _test$tassert_fn((a), (b));                                                    \
         if ((cex$tmpname(err) = genf((a), (b), __LINE__, _cex_test_eq_op__lt))) {                  \
             _test$tassert_breakpoint();                                                            \
             return cex$tmpname(err);                                                               \
         }                                                                                          \
     })
 
+/// Check if a >= b
 #define tassert_ge(a, b)                                                                           \
     ({                                                                                             \
         Exc cex$tmpname(err) = NULL;                                                               \
-        var genf = _test$tassert_fn((a), (b));                                                     \
+        auto genf = _test$tassert_fn((a), (b));                                                    \
         if ((cex$tmpname(err) = genf((a), (b), __LINE__, _cex_test_eq_op__ge))) {                  \
             _test$tassert_breakpoint();                                                            \
             return cex$tmpname(err);                                                               \
         }                                                                                          \
     })
 
+/// Check if a > b
 #define tassert_gt(a, b)                                                                           \
     ({                                                                                             \
         Exc cex$tmpname(err) = NULL;                                                               \
-        var genf = _test$tassert_fn((a), (b));                                                     \
+        auto genf = _test$tassert_fn((a), (b));                                                    \
         if ((cex$tmpname(err) = genf((a), (b), __LINE__, _cex_test_eq_op__gt))) {                  \
             _test$tassert_breakpoint();                                                            \
             return cex$tmpname(err);                                                               \
@@ -2919,9 +4204,553 @@ struct _cex_test_context_s
 
 
 /*
+*                          src/test.c
+*/
+#ifdef CEX_TEST
+#    include <math.h>
+
+#ifdef _WIN32
+#    include <io.h>
+#    include <fcntl.h>
+#endif
+
+enum _cex_test_eq_op_e
+{
+    _cex_test_eq_op__na,
+    _cex_test_eq_op__eq,
+    _cex_test_eq_op__ne,
+    _cex_test_eq_op__lt,
+    _cex_test_eq_op__le,
+    _cex_test_eq_op__gt,
+    _cex_test_eq_op__ge,
+};
+
+static Exc __attribute__((noinline))
+_check_eq_int(i64 a, i64 b, int line, enum _cex_test_eq_op_e op)
+{
+    extern struct _cex_test_context_s _cex_test__mainfn_state;
+    bool passed = false;
+    char* ops = "?";
+    switch (op) {
+        case _cex_test_eq_op__na:
+            unreachable();
+            break;
+        case _cex_test_eq_op__eq:
+            passed = a == b;
+            ops = "!=";
+            break;
+        case _cex_test_eq_op__ne:
+            passed = a != b;
+            ops = "==";
+            break;
+        case _cex_test_eq_op__lt:
+            passed = a < b;
+            ops = ">=";
+            break;
+        case _cex_test_eq_op__le:
+            passed = a <= b;
+            ops = ">";
+            break;
+        case _cex_test_eq_op__gt:
+            passed = a > b;
+            ops = "<=";
+            break;
+        case _cex_test_eq_op__ge:
+            passed = a >= b;
+            ops = "<";
+            break;
+    }
+    if (!passed) {
+        str.sprintf(
+            _cex_test__mainfn_state.str_buf,
+            sizeof(_cex_test__mainfn_state.str_buf),
+            "%s:%d -> %ld %s %ld",
+            _cex_test__mainfn_state.suite_file,
+            line,
+            a,
+            ops,
+            b
+        );
+        return _cex_test__mainfn_state.str_buf;
+    }
+    return EOK;
+}
+
+static Exc __attribute__((noinline))
+_check_eq_almost(f64 a, f64 b, f64 delta, int line)
+{
+    extern struct _cex_test_context_s _cex_test__mainfn_state;
+    bool passed = false;
+    f64 abdelta = a - b;
+    if (isnan(a) && isnan(b)) {
+        passed = true;
+    } else if (isinf(a) && isinf(b)) {
+        passed = (signbit(a) == signbit(b));
+    } else {
+        passed = fabs(abdelta) <= ((delta != 0) ? delta : (f64)0.0000001);
+    }
+    if (!passed) {
+        str.sprintf(
+            _cex_test__mainfn_state.str_buf,
+            sizeof(_cex_test__mainfn_state.str_buf),
+            "%s:%d -> %f != %f (delta: %f, diff: %f)",
+            _cex_test__mainfn_state.suite_file,
+            line,
+            (a),
+            (b),
+            delta,
+            abdelta
+        );
+        return _cex_test__mainfn_state.str_buf;
+    }
+    return EOK;
+}
+
+static Exc __attribute__((noinline))
+_check_eq_f32(f64 a, f64 b, int line, enum _cex_test_eq_op_e op)
+{
+    (void)op;
+    extern struct _cex_test_context_s _cex_test__mainfn_state;
+    bool passed = false;
+    char* ops = "?";
+    f64 delta = a - b;
+    bool is_equal = false;
+
+    if (isnan(a) && isnan(b)) {
+        is_equal = true;
+    } else if (isinf(a) && isinf(b)) {
+        is_equal = (signbit(a) == signbit(b));
+    } else {
+        is_equal = fabs(delta) <= (f64)0.0000001;
+    }
+    switch (op) {
+        case _cex_test_eq_op__na:
+            unreachable();
+            break;
+        case _cex_test_eq_op__eq:
+            passed = is_equal;
+            ops = "!=";
+            break;
+        case _cex_test_eq_op__ne:
+            passed = !is_equal;
+            ops = "==";
+            break;
+        case _cex_test_eq_op__lt:
+            passed = a < b;
+            ops = ">=";
+            break;
+        case _cex_test_eq_op__le:
+            passed = a < b || is_equal;
+            ops = ">";
+            break;
+        case _cex_test_eq_op__gt:
+            passed = a > b;
+            ops = "<=";
+            break;
+        case _cex_test_eq_op__ge:
+            passed = a >= b || is_equal;
+            ops = "<";
+            break;
+    }
+    if (!passed) {
+        str.sprintf(
+            _cex_test__mainfn_state.str_buf,
+            sizeof(_cex_test__mainfn_state.str_buf),
+            "%s:%d -> %f %s %f (delta: %f)",
+            _cex_test__mainfn_state.suite_file,
+            line,
+            a,
+            ops,
+            b,
+            delta
+        );
+        return _cex_test__mainfn_state.str_buf;
+    }
+    return EOK;
+}
+
+static Exc __attribute__((noinline))
+_check_eq_str(char* a, char* b, int line, enum _cex_test_eq_op_e op)
+{
+    bool passed = false;
+    char* ops = "";
+    switch (op) {
+        case _cex_test_eq_op__eq:
+            passed = str.eq(a, b);
+            ops = "!=";
+            break;
+        case _cex_test_eq_op__ne:
+            passed = !str.eq(a, b);
+            ops = "==";
+            break;
+        default:
+            unreachable();
+    }
+    extern struct _cex_test_context_s _cex_test__mainfn_state;
+    if (!passed) {
+        str.sprintf(
+            _cex_test__mainfn_state.str_buf,
+            CEX_TEST_AMSG_MAX_LEN - 1,
+            "%s:%d -> '%s' %s '%s'",
+            _cex_test__mainfn_state.suite_file,
+            line,
+            a,
+            ops,
+            b
+        );
+        return _cex_test__mainfn_state.str_buf;
+    }
+    return EOK;
+}
+
+static Exc __attribute__((noinline))
+_check_eq_err(char* a, char* b, int line)
+{
+    extern struct _cex_test_context_s _cex_test__mainfn_state;
+    if (!str.eq(a, b)) {
+        char* ea = (a == EOK) ? "Error.ok" : a;
+        char* eb = (b == EOK) ? "Error.ok" : b;
+        str.sprintf(
+            _cex_test__mainfn_state.str_buf,
+            CEX_TEST_AMSG_MAX_LEN - 1,
+            "%s:%d -> Exc mismatch '%s' != '%s'",
+            _cex_test__mainfn_state.suite_file,
+            line,
+            ea,
+            eb
+        );
+        return _cex_test__mainfn_state.str_buf;
+    }
+    return EOK;
+}
+
+
+static Exc __attribute__((noinline))
+_check_eq_ptr(void* a, void* b, int line)
+{
+    extern struct _cex_test_context_s _cex_test__mainfn_state;
+    if (a != b) {
+        str.sprintf(
+            _cex_test__mainfn_state.str_buf,
+            CEX_TEST_AMSG_MAX_LEN - 1,
+            "%s:%d -> %p != %p (ptr_diff: %ld)",
+            _cex_test__mainfn_state.suite_file,
+            line,
+            a,
+            b,
+            (a - b)
+        );
+        return _cex_test__mainfn_state.str_buf;
+    }
+    return EOK;
+}
+
+static Exc __attribute__((noinline))
+_check_eqs_slice(str_s a, str_s b, int line, enum _cex_test_eq_op_e op)
+{
+    bool passed = false;
+    char* ops = "";
+    switch (op) {
+        case _cex_test_eq_op__eq:
+            passed = str.slice.eq(a, b);
+            ops = "!=";
+            break;
+        case _cex_test_eq_op__ne:
+            passed = !str.slice.eq(a, b);
+            ops = "==";
+            break;
+        default:
+            unreachable();
+    }
+    extern struct _cex_test_context_s _cex_test__mainfn_state;
+    if (!passed) {
+        if (str.sprintf(
+                _cex_test__mainfn_state.str_buf,
+                CEX_TEST_AMSG_MAX_LEN - 1,
+                "%s:%d -> '%S' %s '%S'",
+                _cex_test__mainfn_state.suite_file,
+                line,
+                a,
+                ops,
+                b
+            )) {}
+        return _cex_test__mainfn_state.str_buf;
+    }
+    return EOK;
+}
+
+static void __attribute__((noinline))
+cex_test_mute()
+{
+    extern struct _cex_test_context_s _cex_test__mainfn_state;
+    struct _cex_test_context_s* ctx = &_cex_test__mainfn_state;
+    if (ctx->out_stream) {
+        fflush(stdout);
+        io.rewind(ctx->out_stream);
+        fflush(ctx->out_stream);
+
+#    ifdef _WIN32
+        _dup2(_fileno(ctx->out_stream), STDOUT_FILENO);
+#    else
+        dup2(fileno(ctx->out_stream), STDOUT_FILENO);
+#    endif
+
+    }
+}
+static void __attribute__((noinline))
+cex_test_unmute(Exc test_result)
+{
+    (void)test_result;
+    extern struct _cex_test_context_s _cex_test__mainfn_state;
+    struct _cex_test_context_s* ctx = &_cex_test__mainfn_state;
+    if (ctx->out_stream) {
+        fflush(stdout);
+        putc('\0', stdout);
+        fflush(stdout);
+        isize flen = io.file.size(ctx->out_stream);
+        io.rewind(ctx->out_stream);
+#    ifdef _WIN32
+        _dup2(ctx->orig_stdout_fd, STDOUT_FILENO);
+#    else
+        dup2(ctx->orig_stdout_fd, STDOUT_FILENO);
+#    endif
+
+        if (test_result != EOK && flen > 1) {
+            fflush(stdout);
+            fflush(stderr);
+            fprintf(stderr, "\n============== TEST OUTPUT >>>>>>>=============\n\n");
+            int c;
+            while ((c = fgetc(ctx->out_stream)) != EOF && c != '\0') { putc(c, stderr); }
+            fprintf(stderr, "\n============== <<<<<< TEST OUTPUT =============\n");
+        }
+    }
+}
+
+
+static int __attribute__((noinline))
+cex_test_main_fn(int argc, char** argv)
+{
+    (void)argc;
+    (void)argv;
+    extern struct _cex_test_context_s _cex_test__mainfn_state;
+
+    struct _cex_test_context_s* ctx = &_cex_test__mainfn_state;
+    if (ctx->test_cases == NULL) {
+        fprintf(stderr, "No test$case() in the test file: %s\n", __FILE__);
+        return 1;
+    }
+    u32 max_name = 0;
+    for$each (t, ctx->test_cases) {
+        if (max_name < strlen(t.test_name) + 2) { max_name = strlen(t.test_name) + 2; }
+    }
+    max_name = (max_name < 70) ? 70 : max_name;
+
+    ctx->quiet_mode = false;
+    ctx->has_ansi = io.isatty(stdout);
+
+    argparse_opt_s options[] = {
+        argparse$opt_help(),
+        argparse$opt(&ctx->case_filter, 'f', "filter", .help = "execute cases with filter"),
+        argparse$opt(&ctx->quiet_mode, 'q', "quiet", .help = "run test in quiet_mode"),
+        argparse$opt(&ctx->breakpoint, 'b', "breakpoint", .help = "breakpoint on tassert failure"),
+        argparse$opt(
+            &ctx->no_stdout_capture,
+            'o',
+            "no-capture",
+            .help = "prints all stdout as test goes"
+        ),
+    };
+
+    argparse_c args = {
+        .options = options,
+        .options_len = arr$len(options),
+        .description = "Test runner program",
+    };
+
+    e$except_silent (err, argparse.parse(&args, argc, argv)) { return 1; }
+
+    if (!ctx->no_stdout_capture) {
+        ctx->out_stream = tmpfile();
+        if (ctx->out_stream == NULL) {
+            fprintf(stderr, "Failed opening temp output for capturing tests\n");
+            uassert(false && "TODO: test this");
+        }
+    }
+
+#    ifdef _WIN32
+    ctx->orig_stdout_fd = _dup(_fileno(stdout));
+#    else
+    ctx->orig_stdout_fd = dup(fileno(stdout));
+#    endif
+
+    mem$scope(tmem$, _)
+    {
+        void* data = mem$malloc(_, 120);
+        (void)data;
+        uassert(data != NULL && "priming temp allocator failed");
+    }
+
+    if (!ctx->quiet_mode) {
+        fprintf(stderr, "-------------------------------------\n");
+        fprintf(stderr, "Running Tests: %s\n", argv[0]);
+        fprintf(stderr, "-------------------------------------\n\n");
+    }
+    if (ctx->setup_suite_fn) {
+        Exc err = NULL;
+        if ((err = ctx->setup_suite_fn())) {
+            fprintf(
+                stderr,
+                "[%s] test$setup_suite() failed with %s (suite %s stopped)\n",
+                ctx->has_ansi ? io$ansi("FAIL", "31") : "FAIL",
+                err,
+                __FILE__
+            );
+            return 1;
+        }
+    }
+
+    if (ctx->quiet_mode) { fprintf(stderr, "%s ", ctx->suite_file); }
+
+    for$each (t, ctx->test_cases) {
+        ctx->case_name = t.test_name;
+        ctx->tests_run++;
+        if (ctx->case_filter && !str.find(t.test_name, ctx->case_filter)) { continue; }
+
+        if (!ctx->quiet_mode) {
+            fprintf(stderr, "%s", t.test_name);
+            for (u32 i = 0; i < max_name - strlen(t.test_name) + 2; i++) { putc('.', stderr); }
+            if (ctx->no_stdout_capture) { putc('\n', stderr); }
+        }
+
+#    ifndef NDEBUG
+        uassert_enable(); // unconditionally enable previously disabled asserts
+#    endif
+        Exc err = EOK;
+        AllocatorHeap_c* alloc_heap = (AllocatorHeap_c*)mem$;
+        alloc_heap->stats.n_allocs = 0;
+        alloc_heap->stats.n_free = 0;
+
+        if (ctx->setup_case_fn && (err = ctx->setup_case_fn()) != EOK) {
+            fflush(stdout);
+            fprintf(
+                stderr,
+                "[%s] test$setup() failed with '%s' (suite %s stopped)\n",
+                ctx->has_ansi ? io$ansi("FAIL", "31") : "FAIL",
+                err,
+                __FILE__
+            );
+            return 1;
+        }
+
+        cex_test_mute();
+        err = t.test_fn();
+        if (ctx->quiet_mode && err != EOK) {
+            fprintf(stdout, "[%s] %s\n", ctx->has_ansi ? io$ansi("FAIL", "31") : "FAIL", err);
+            fprintf(stdout, "Test suite: %s case: %s\n", ctx->suite_file, t.test_name);
+        }
+        cex_test_unmute(err);
+
+        if (err == EOK) {
+            if (ctx->quiet_mode) {
+                fprintf(stderr, ".");
+            } else {
+                fprintf(stderr, "[%s]\n", ctx->has_ansi ? io$ansi("PASS", "32") : "PASS");
+            }
+        } else {
+            ctx->tests_failed++;
+            if (!ctx->quiet_mode) {
+                fprintf(
+                    stderr,
+                    "[%s] %s (%s)\n",
+                    ctx->has_ansi ? io$ansi("FAIL", "31") : "FAIL",
+                    err,
+                    t.test_name
+                );
+            } else {
+                fprintf(stderr, "F");
+            }
+        }
+        if (ctx->teardown_case_fn && (err = ctx->teardown_case_fn()) != EOK) {
+            fflush(stdout);
+            fprintf(
+                stderr,
+                "[%s] test$teardown() failed with %s (suite %s stopped)\n",
+                ctx->has_ansi ? io$ansi("FAIL", "31") : "FAIL",
+                err,
+                __FILE__
+            );
+            return 1;
+        }
+        if (err == EOK && alloc_heap->stats.n_allocs != alloc_heap->stats.n_free) {
+            if (!ctx->quiet_mode) {
+                fprintf(stderr, "%s", t.test_name);
+                for (u32 i = 0; i < max_name - strlen(t.test_name) + 2; i++) { putc('.', stderr); }
+            } else {
+                putc('\n', stderr);
+            }
+            fprintf(
+                stderr,
+                "[%s] %s:%d Possible memory leak: allocated %d != free %d\n",
+                ctx->has_ansi ? io$ansi("LEAK", "33") : "LEAK",
+                ctx->suite_file,
+                t.test_line,
+                alloc_heap->stats.n_allocs,
+                alloc_heap->stats.n_free
+            );
+            ctx->tests_failed++;
+        }
+    }
+
+    if (ctx->teardown_suite_fn) {
+        e$except (err, ctx->teardown_suite_fn()) {
+            fprintf(
+                stderr,
+                "[%s] test$teardown_suite() failed with %s (suite %s stopped)\n",
+                ctx->has_ansi ? io$ansi("FAIL", "31") : "FAIL",
+                err,
+                __FILE__
+            );
+            return 1;
+        }
+    }
+
+    if (!ctx->quiet_mode) {
+        fprintf(stderr, "\n-------------------------------------\n");
+        fprintf(
+            stderr,
+            "Total: %d Passed: %d Failed: %d\n",
+            ctx->tests_run,
+            ctx->tests_run - ctx->tests_failed,
+            ctx->tests_failed
+        );
+        fprintf(stderr, "-------------------------------------\n");
+    } else {
+        fprintf(stderr, "\n");
+
+        if (ctx->tests_failed) {
+            fprintf(
+                stderr,
+                "\n[%s] %s %d tests failed\n",
+                (ctx->has_ansi ? io$ansi("FAIL", "31") : "FAIL"),
+                ctx->suite_file,
+                ctx->tests_failed
+            );
+        }
+    }
+
+    if (ctx->out_stream) {
+        fclose(ctx->out_stream);
+        ctx->out_stream = NULL;
+    }
+    return ctx->tests_run == 0 || ctx->tests_failed > 0;
+}
+#endif // ifdef CEX_TEST
+
+
+
+/*
 *                          src/cex_code_gen.h
 */
-#if defined(CEX_BUILD) || defined(CEX_NEW)
 
 typedef struct _cex__codegen_s
 {
@@ -2933,12 +4762,117 @@ typedef struct _cex__codegen_s
 /*
  *                  CODE GEN MACROS
  */
+
+/**
+* Code generation module 
+
+```c
+
+test$case(test_codegen_test)
+{
+    sbuf_c b = sbuf.create(1024, mem$);
+    // NOTE: cg$ macros should be working within cg$init() scope or make sure cg$var is available
+    cg$init(&b);
+
+    tassert(cg$var->buf == &b);
+    tassert(cg$var->indent == 0);
+
+    cg$pn("printf(\"hello world\");");
+    cg$pn("#define GOO");
+    cg$pn("// this is empty scope");
+    cg$scope("", "")
+    {
+        cg$pf("printf(\"hello world: %d\");", 2);
+    }
+
+    cg$func("void my_func(int arg_%d)", 2)
+    {
+        cg$scope("var my_var = (mytype)", "")
+        {
+            cg$pf(".arg1 = %d,", 1);
+            cg$pf(".arg2 = %d,", 2);
+        }
+        cg$pa(";\n", "");
+
+        cg$if("foo == %d", 312)
+        {
+            cg$pn("printf(\"Hello: %d\", foo);");
+        }
+        cg$elseif("bar == foo + %d", 7)
+        {
+            cg$pn("// else if scope");
+        }
+        cg$else()
+        {
+            cg$pn("// else scope");
+        }
+
+        cg$while("foo == %d", 312)
+        {
+            cg$pn("printf(\"Hello: %d\", foo);");
+        }
+
+        cg$for("u32 i = 0; i < %d; i++", 312)
+        {
+            cg$pn("printf(\"Hello: %d\", foo);");
+            cg$foreach("it, my_var", "")
+            {
+                cg$pn("printf(\"Hello: %d\", foo);");
+            }
+        }
+
+        cg$scope("do ", "")
+        {
+            cg$pf("// do while", 1);
+        }
+        cg$pa(" while(0);\n", "");
+    }
+
+    cg$switch("foo", "")
+    {
+        cg$case("'%c'", 'a')
+        {
+            cg$pn("// case scope");
+        }
+        cg$scope("case '%c': ", 'b')
+        {
+            cg$pn("fallthrough();");
+        }
+        cg$default()
+        {
+            cg$pn("// default scope");
+        }
+    }
+
+    tassert(cg$is_valid());
+
+    printf("result: \n%s\n", b);
+
+
+    sbuf.destroy(&b);
+    return EOK;
+}
+
+```
+
+*/
+#define __cg$
+
+/// Common code gen buffer variable (all cg$ macros use it under the hood)
 #    define cg$var __cex_code_gen
+
+/// Initializes new code generator (uses sbuf instance as backing buffer)
 #    define cg$init(out_sbuf)                                                                      \
         _cex__codegen_s cex$tmpname(code_gen) = { .buf = (out_sbuf) };                             \
         _cex__codegen_s* cg$var = &cex$tmpname(code_gen)
+
+/// false if any cg$ operation failed, use cg$var->error to get Exception type of error
 #    define cg$is_valid() (cg$var != NULL && cg$var->buf != NULL && cg$var->error == EOK)
+
+/// increase code indent by 4
 #    define cg$indent() ({ cg$var->indent += 4; })
+
+/// decrease code indent by 4
 #    define cg$dedent()                                                                            \
         ({                                                                                         \
             if (cg$var->indent >= 4) cg$var->indent -= 4;                                          \
@@ -2947,47 +4881,69 @@ typedef struct _cex__codegen_s
 /*
  *                  CODE MACROS
  */
-#    define $pn(text)                                                                              \
+/// add new line of code
+#    define cg$pn(text)                                                                            \
         ((text && text[0] == '\0') ? _cex__codegen_print_line(cg$var, "\n")                        \
                                    : _cex__codegen_print_line(cg$var, "%s\n", text))
-#    define $pf(format, ...) _cex__codegen_print_line(cg$var, format "\n", __VA_ARGS__)
-#    define $pa(format, ...) _cex__codegen_print(cg$var, true, format, __VA_ARGS__)
+
+/// add new line of code with formatting
+#    define cg$pf(format, ...) _cex__codegen_print_line(cg$var, format "\n", __VA_ARGS__)
+
+/// append code at the current line without "\n"
+#    define cg$pa(format, ...) _cex__codegen_print(cg$var, true, format, __VA_ARGS__)
 
 // clang-format off
-#define $scope(format, ...) \
+
+/// add new code scope with indent (use for low-level stuff)
+#define cg$scope(format, ...) \
     for (_cex__codegen_s* cex$tmpname(codegen_scope)  \
                 __attribute__ ((__cleanup__(_cex__codegen_print_scope_exit))) =     \
                 _cex__codegen_print_scope_enter(cg$var, format, __VA_ARGS__),       \
         *cex$tmpname(codegen_sentinel) = cg$var;                                    \
         cex$tmpname(codegen_sentinel) && cex$tmpname(codegen_scope) != NULL;        \
         cex$tmpname(codegen_sentinel) = NULL)
-#define $func(format, ...) $scope(format, __VA_ARGS__)
 // clang-format on
 
 
-#    define $if(format, ...) $scope("if (" format ") ", __VA_ARGS__)
-#    define $elseif(format, ...)                                                                   \
-        $pa(" else ", "");                                                                         \
-        $if(format, __VA_ARGS__)
-#    define $else()                                                                                \
-        $pa(" else", "");                                                                          \
-        $scope(" ", "")
+/// add new function     cg$func("void my_func(int arg_%d)", 2)
+#    define cg$func(format, ...) cg$scope(format, __VA_ARGS__)
 
+/// add if statement
+#    define cg$if(format, ...) cg$scope("if (" format ") ", __VA_ARGS__)
 
-#    define $while(format, ...) $scope("while (" format ") ", __VA_ARGS__)
-#    define $for(format, ...) $scope("for (" format ") ", __VA_ARGS__)
-#    define $foreach(format, ...) $scope("for$each (" format ") ", __VA_ARGS__)
+/// add else if
+#    define cg$elseif(format, ...)                                                                   \
+        cg$pa(" else ", "");                                                                       \
+        cg$if(format, __VA_ARGS__)
 
+/// add else 
+#    define cg$else()                                                                                \
+        cg$pa(" else", "");                                                                        \
+        cg$scope(" ", "")
 
-#    define $switch(format, ...) $scope("switch (" format ") ", __VA_ARGS__)
-#    define $case(format, ...)                                                                     \
+/// add while loop
+#    define cg$while(format, ...) cg$scope("while (" format ") ", __VA_ARGS__)
+
+/// add for loop
+#    define cg$for(format, ...) cg$scope("for (" format ") ", __VA_ARGS__)
+
+/// add CEX for$each loop
+#    define cg$foreach(format, ...) cg$scope("for$each (" format ") ", __VA_ARGS__)
+
+/// add switch() statement
+#    define cg$switch(format, ...) cg$scope("switch (" format ") ", __VA_ARGS__)
+
+/// add case in switch() statement
+#    define cg$case(format, ...)                                                                     \
         for (_cex__codegen_s * cex$tmpname(codegen_scope)                                          \
                                    __attribute__((__cleanup__(_cex__codegen_print_case_exit))) =   \
                  _cex__codegen_print_case_enter(cg$var, "case " format, __VA_ARGS__),              \
                                    *cex$tmpname(codegen_sentinel) = cg$var;                        \
              cex$tmpname(codegen_sentinel) && cex$tmpname(codegen_scope) != NULL;                  \
              cex$tmpname(codegen_sentinel) = NULL)
-#    define $default()                                                                             \
+
+/// add default in switch() statement
+#    define cg$default()                                                                             \
         for (_cex__codegen_s * cex$tmpname(codegen_scope)                                          \
                                    __attribute__((__cleanup__(_cex__codegen_print_case_exit))) =   \
                  _cex__codegen_print_case_enter(cg$var, "default", NULL),                          \
@@ -3004,7 +4960,6 @@ _cex__codegen_s* _cex__codegen_print_case_enter(_cex__codegen_s* cg, char* forma
 void _cex__codegen_print_case_exit(_cex__codegen_s** cgptr);
 void _cex__codegen_indent(_cex__codegen_s* cg);
 
-#endif // ifdef CEX_BUILD
 
 
 
@@ -3442,230 +5397,6 @@ struct __cex_namespace__CexParser {
 
 
 /*
-*                          src/json.h
-*/
-
-#ifndef CEX_MAX_JSON_DEPTH
-#    define CEX_MAX_JSON_DEPTH 128
-#endif
-
-/// Beginning of json$key_match chain (always first, checks if key is NULL)
-#define json$key_invalid(json_iter) if (unlikely((json_iter)->key.buf == NULL))
-
-/// Matches object key by key literal name (compile time optimized string compare)
-#define json$key_match(json_iter, key_literal)                                                     \
-    else if ((json_iter)->key.len == sizeof(key_literal) - 1 &&                                    \
-             memcmp((json_iter)->key.buf, key_literal, sizeof(key_literal) - 1) == 0)
-
-/// Checks if there is unexpected key
-#define json$key_unmatched(json_iter) else
-
-typedef enum JsonType_e
-{
-    JsonType__eos = -2, // end of scope (after json.iter.step_in())
-    JsonType__err = -1, // data/integrity error
-    JsonType__eof = 0,  // end of file reached
-    JsonType__str,      // quoted string
-    JsonType__obj,      // {key: value} object
-    JsonType__arr,      // [ ... ] array
-    JsonType__num,      // floating point num
-    JsonType__bool,     // boolean
-    JsonType__null,     // null (obj/arr)
-    // -----------
-    JsonType__cnt,
-} JsonType_e;
-
-
-typedef struct json_iter_c
-{
-    str_s val;       // string value of the json item
-    str_s key;       // associated key of the val (if inside object)
-    JsonType_e type; // current json item type (also error, EOF, end-of-scope indication)
-    Exc error;       // last iterator error
-
-    struct
-    {
-        CexParser_c lexer;   // JSON lexer
-        bool strict_mode;    // enforces JSON compliant spec
-        bool has_items;      // flag is set when at least one item processed in scope
-        CexTkn_e prev_token; // JSON previous token
-        CexTkn_e curr_token; // JSON current token
-        u32 scope_depth;
-        char scope_stack[CEX_MAX_JSON_DEPTH];
-    } _impl;
-
-} json_iter_c;
-
-typedef struct json_buf_c
-{
-    sbuf_c buf;
-    u32 indent;
-    u32 indent_width;
-    Exc error;
-    u32 scope_depth;
-    char scope_stack[CEX_MAX_JSON_DEPTH];
-} json_buf_c;
-
-#define _json$buf_var _json_buf_macro_scope
-
-/// Opens JSON buffer scope (json_buf_ptr data is cleared out)
-#define json$buf(json_buf_ptr, jsontype_arr_or_obj)                                                \
-    _cex_json__buf__clear((json_buf_ptr));                                                         \
-    for (json_buf_c * _json$buf_var __attribute__((__cleanup__(_cex__jsonbuf_print_scope_exit))) = \
-             _cex__jsonbuf_print_scope_enter((json_buf_ptr), jsontype_arr_or_obj),                 \
-                                    *cex$tmpname(jsonbuf_sentinel) = _json$buf_var;                \
-         cex$tmpname(jsonbuf_sentinel) && _json$buf_var != NULL;                                   \
-         cex$tmpname(jsonbuf_sentinel) = NULL)
-
-
-/// Add new key: {...} scope into (json$buf)
-#define json$kobj(key)                                                                             \
-    _cex_json__buf__print(_json$buf_var, "\"%s\": ", key);                                         \
-    json$obj()
-
-/// Add new key: [...] scope into (json$buf)
-#define json$karr(key)                                                                             \
-    _cex_json__buf__print(_json$buf_var, "\"%s\": ", key);                                         \
-    json$arr()
-
-/// Add new {...} scope into (json$buf)
-#define json$obj()                                                                                 \
-    for (json_buf_c * cex$tmpname(jsonbuf_scope)                                                   \
-                          __attribute__((__cleanup__(_cex__jsonbuf_print_scope_exit))) =           \
-             _cex__jsonbuf_print_scope_enter(_json$buf_var, JsonType__obj),                        \
-                          *cex$tmpname(jsonbuf_sentinel) = cex$tmpname(jsonbuf_scope);             \
-         cex$tmpname(jsonbuf_sentinel) && cex$tmpname(jsonbuf_scope) != NULL;                      \
-         cex$tmpname(jsonbuf_sentinel) = NULL)
-
-/// Add new [...] scope into (json$buf)
-#define json$arr()                                                                                 \
-    for (json_buf_c * cex$tmpname(jsonbuf_scope)                                                   \
-                          __attribute__((__cleanup__(_cex__jsonbuf_print_scope_exit))) =           \
-             _cex__jsonbuf_print_scope_enter(_json$buf_var, JsonType__arr),                        \
-                          *cex$tmpname(jsonbuf_sentinel) = cex$tmpname(jsonbuf_scope);             \
-         cex$tmpname(jsonbuf_sentinel) && cex$tmpname(jsonbuf_scope) != NULL;                      \
-         cex$tmpname(jsonbuf_sentinel) = NULL)
-
-/// Append any formatted string, it's for low level printing (json$buf)
-#define json$fmt(format, ...) _cex_json__buf__print(_json$buf_var, format, __VA_ARGS__)
-
-/// Append string item into array scope (json$buf)
-#define json$str(format, ...)                                                                      \
-    _cex_json__buf__print_item(_json$buf_var, "\"" format "\"", __VA_ARGS__)
-
-/// Append value item into array scope (json$buf)
-#define json$val(format, ...) _cex_json__buf__print_item(_json$buf_var, format "", __VA_ARGS__)
-
-/// Append `"<key>": "<format>"` (with your own format) into object scope (json$buf)
-#define json$kstr(key, format, ...)                                                                \
-    _cex_json__buf__print_key(_json$buf_var, (key), "\"" format "\"", __VA_ARGS__)
-
-/// Append `"<key>": <format>` into object scope (json$buf)
-#define json$kval(key, format, ...)                                                                \
-    _cex_json__buf__print_key(_json$buf_var, (key), format, __VA_ARGS__)
-
-void _cex_json__buf__clear(json_buf_c* jb);
-void _cex_json__buf__print(json_buf_c* jb, char* format, ...);
-void _cex_json__buf__print_item(json_buf_c* jb, char* format, ...);
-void _cex_json__buf__print_key(json_buf_c* jb, char* key, char* format, ...);
-json_buf_c* _cex__jsonbuf_print_scope_enter(json_buf_c* jb, JsonType_e scope_type);
-void _cex__jsonbuf_print_scope_exit(json_buf_c** jbptr);
-
-
-/**
-Low level JSON reader/writer namespace
-
-Making own JSON buffer:
-
-```c
-json_buf_c jb;
-e$ret(json.buf.create(&jb, 1024, 0, mem$));
-json$buf(&jb, JsonType__obj)
-{
-    json$kstr("foo2", "%d", 1);
-    json$kobj("foo3") {
-        json$kval("bar", "%s", "3");
-    }
-    json$karr("foo3") {
-        json$val("%d", 8);
-        json$str("%d", 9);
-    }
-}
->> json.buf.get(&jb) ->
->> {"foo2": "1", "foo3": {"bar": 3},"foo3": [8, "9"]}
-
-
-Reading JSON buffer:
-```c
-    struct Foo
-    {
-        struct { u32 baz; u32 fuzz; } foo;
-        u32 next;
-        u32 baz;
-    } data = { 0 };
-    str_s content = str$s(
-        "{ \"foo\" : {\"baz\": 3, \"fuzz\": 8, \"oops\": 0}, \"next\": 7, \"baz\": 17 }"
-    );
-    json_iter_c js;
-    e$ret(json.iter.create(&js, content.buf, 0, false));
-    if (json.iter.next(&js)) { e$ret(json.iter.step_in(&js, JsonType__obj)); }
-    while (json.iter.next(&js)) {
-        json$key_invalid (&js) {}
-        json$key_match (&js, "foo") {
-            e$ret(json.iter.step_in(&js, JsonType__obj));
-            while (json.iter.next(&js)) {
-                json$key_invalid (&js) {}
-                json$key_match (&js, "fuzz") { e$ret(str$convert(js.val, &data.foo.fuzz)); }
-                json$key_match (&js, "baz") { e$ret(str$convert(js.val, &data.foo.baz)); }
-                json$key_unmatched(&js)
-                {
-                    tassert_eq(js.key, str$s("oops"));
-                }
-            }
-        }
-        json$key_match (&js, "next") { e$ret(str$convert(js.val, &data.next)); }
-        json$key_match (&js, "baz") { e$ret(str$convert(js.val, &data.baz)); }
-    }
-    e$assert(js.error == EOK && "No parsing errors");
-
-```
-
-*/
-struct __cex_namespace__json {
-    // Autogenerated by CEX
-    // clang-format off
-
-
-    struct {
-        /// Create JSON buffer/builder container used with json$buf / json$fmt / json$kstr macros
-        Exception       (*create)(json_buf_c* jb, u32 capacity, u8 indent, IAllocator allc);
-        /// Destroy JSON buffer instance (not necessary to call if initialized on tmem$ allocator)
-        void            (*destroy)(json_buf_c* jb);
-        /// Get JSON buffer contents (NULL if any error occurred)
-        char*           (*get)(json_buf_c* jb);
-        /// Check if there is any error in JSON buffer
-        Exception       (*validate)(json_buf_c* jb);
-    } buf;
-
-    struct {
-        /// Create new JSON reader (it doesn't allocate memory and uses content slicing)
-        Exception       (*create)(json_iter_c* it, char* content, usize content_len, bool strict_mode);
-        /// Get next JSON item for a scope
-        bool            (*next)(json_iter_c* it);
-        /// Make step inside JSON object or array scope (json.iter.next() starts emitting this scope)
-        Exception       (*step_in)(json_iter_c* it, JsonType_e expected_type);
-        /// Early step out from JSON scope (you must immediately break the loop/func after step out)
-        Exception       (*step_out)(json_iter_c* it);
-    } iter;
-
-    // clang-format on
-};
-CEX_NAMESPACE struct __cex_namespace__json json;
-
-
-
-
-/*
 *                          src/cex_maker.h
 */
 
@@ -3675,17 +5406,24 @@ CEX_NAMESPACE struct __cex_namespace__json json;
 */
 
 /// Fuzz case: ``int fuzz$case(const u8* data, usize size) { return 0;}
-#define fuzz$case test$NOOPT LLVMFuzzerTestOneInput
+#define fuzz$case test$noopt LLVMFuzzerTestOneInput
 
 /// Fuzz test constructor (for building corpus seeds programmatically)
 #define fuzz$setup __attribute__((constructor)) void _cex_fuzzer_setup_constructor
 
+/// Special fuzz variable used by all fuzz$ macros
 #define fuzz$dvar _cex_fuz_dvar
+
+/// Initialize fuzz$ helper macros
 #define fuzz$dnew(data, size) cex_fuzz_s fuzz$dvar = fuzz.create((data), (size))
-#define fuzz$dget(out_result) fuzz.dget(&(fuzz$dvar), (out_result), sizeof(*(out_result)))
+
+/// Load random data into variable by pointer from random fuzz data
+#define fuzz$dget(out_result_ptr) fuzz.dget(&(fuzz$dvar), (out_result_ptr), sizeof(*(out_result_ptr)))
+
+/// Get deterministic probability based on fuzz data
 #define fuzz$dprob(prob_threshold) fuzz.dprob(&(fuzz$dvar), prob_threshold)
 
-// Current fuzz_ file corpus directory
+/// Current fuzz_ file corpus directory relative to calling source file
 #define fuzz$corpus_dir fuzz.corpus_dir(__FILE_NAME__)                                                                          \
 
 /// Fuzz data fetcher (makes C-type payloads from random fuzz$case data)
@@ -3710,7 +5448,7 @@ void __AFL_INIT(void);
 int __AFL_LOOP(unsigned int N);
 #    endif
 #    define fuzz$main()                                                                            \
-        test$NOOPT int main(int argc, char** argv)                                                 \
+        test$noopt int main(int argc, char** argv)                                                 \
         {                                                                                          \
             (void)argc;                                                                            \
             (void)argv;                                                                            \
@@ -3738,13 +5476,137 @@ int __AFL_LOOP(unsigned int N);
 
 #endif
 
+/**
+- Fuzz runner commands
+
+`./cex fuzz create fuzz/myapp/fuzz_bar.c`
+
+`./cex fuzz run fuzz/myapp/fuzz_bar.c`
+
+- Fuzz testing tools using `fuzz` namespace
+
+```c
+
+int
+fuzz$case(const u8* data, usize size)
+{
+    cex_fuzz_s fz = fuzz.create(data, size);
+    u16 random_val = 0;
+    some_struct random_struct = {0}; 
+
+    while(fuzz.dget(&fz, &random_val, sizeof(random_val))) {
+        // testing function with random data
+        my_func(random_val);
+
+        // checking probability based on fuzz data
+        if (fuzz.dprob(&fz, 0.2)) {
+            my_func(random_val * 10);
+        }
+
+        if (fuzz.dget(&fz, &random_struct, sizeof(random_struct))){
+            my_func_struct(&random_struct);
+        }
+    }
+}
+
+```
+- Fuzz testing tools using `fuzz$` macros (shortcuts)
+
+```c
+
+int
+fuzz$case(const u8* data, usize size)
+{
+    fuzz$dnew(data, size);
+
+    u16 random_val = 0;
+    some_struct random_struct = {0}; 
+
+    while(fuzz$dget(&random_val)) {
+        // testing function with random data
+        my_func(random_val);
+
+        // checking probability based on fuzz data
+        if (fuzz$dprob(0.2)) {
+            my_func(random_val * 10);
+        }
+
+        // it's possible to fill whole structs with data
+        if (fuzz$dget(&random_struct)){
+            my_func_struct(&random_struct);
+        }
+    }
+}
+
+```
+
+- Fuzz corpus priming (it's optional step, but useful)
+
+```c
+
+typedef struct fuzz_match_s
+{
+    char pattern[100];
+    char null_term;
+    char text[300];
+    char null_term2;
+} fuzz_match_s;
+
+Exception
+match_make(char* out_file, char* text, char* pattern)
+{
+    fuzz_match_s f = { 0 };
+    e$ret(str.copy(f.text, text, sizeof(f.text)));
+    e$ret(str.copy(f.pattern, pattern, sizeof(f.pattern)));
+
+    FILE* fh;
+    e$ret(io.fopen(&fh, out_file, "wb"));
+    e$ret(io.fwrite(fh, &f, sizeof(f)));
+    io.fclose(&fh);
+
+    return EOK;
+}
+
+fuzz$setup()
+{
+    if (os.fs.mkdir(fuzz$corpus_dir)) {}
+
+    struct
+    {
+        char* text;
+        char* pattern;
+    } match_tuple[] = {
+        { "test", "*" },
+        { "", "*" },
+        { ".txt", "*.txt" },
+        { "test.txt", "" },
+        { "test.txt", "*txt" },
+    };
+    mem$scope(tmem$, _)
+    {
+        for (u32 i = 0; i < arr$len(match_tuple); i++) {
+            char* fn = str.fmt(_, "%s/%05d", fuzz$corpus_dir, i);
+            e$except (err, match_make(fn, match_tuple[i].text, match_tuple[i].pattern)) {
+                uassertf(false, "Error writing file: %s", fn);
+            }
+        }
+    }
+}
+
+```
+
+*/
 struct __cex_namespace__fuzz {
     // Autogenerated by CEX
     // clang-format off
 
+    /// Get current corpus dir relative tho the `this_file_name`
     char*           (*corpus_dir)(char* this_file_name);
+    /// Creates new fuzz data generator, for fuzz-driven randomization
     cex_fuzz_s      (*create)(const u8* data, usize size);
+    /// Get result from random data into buffer (returns false if not enough data)
     bool            (*dget)(cex_fuzz_s* fz, void* out_result, usize result_size);
+    /// Get deterministic probability using fuzz data, based on threshold
     bool            (*dprob)(cex_fuzz_s* fz, double threshold);
 
     // clang-format on
@@ -3752,6 +5614,11 @@ struct __cex_namespace__fuzz {
 CEX_NAMESPACE struct __cex_namespace__fuzz fuzz;
 
 
+
+
+/*
+*                          src/cex_footer.h
+*/
 
 
 /*
@@ -3898,7 +5765,7 @@ _cex_global_allocators_destructor()
     AllocatorArena_c* allc = (AllocatorArena_c*)tmem$;
     allocator_arena_page_s* page = allc->last_page;
     while (page) {
-        var tpage = page->prev_page;
+        auto tpage = page->prev_page;
         mem$free(mem$, page);
         page = tpage;
     }
@@ -4000,7 +5867,7 @@ _cex_allocator_heap__hdr_make(usize alloc_size, usize alignment)
 #endif
 
     if (alignment < 8) {
-        _Static_assert(alignof(void*) <= 8, "unexpected ptr alignment");
+        static_assert(alignof(void*) <= 8, "unexpected ptr alignment");
         alignment = 8;
     } else {
         uassert(mem$is_power_of2(alignment) && "must be pow2");
@@ -4304,8 +6171,8 @@ _cex_alloc_estimate_alloc_size(usize alloc_size, usize alignment)
     usize size = alloc_size;
 
     if (alignment < 8) {
-        _Static_assert(sizeof(allocator_arena_rec_s) == 8, "unexpected size");
-        _Static_assert(alignof(void*) <= 8, "unexpected ptr alignment");
+        static_assert(sizeof(allocator_arena_rec_s) == 8, "unexpected size");
+        static_assert(alignof(void*) <= 8, "unexpected ptr alignment");
         alignment = 8;
         size = mem$aligned_round(alloc_size, 8);
     } else {
@@ -4349,7 +6216,7 @@ _cex_allocator_arena__check_pointer_valid(AllocatorArena_c* self, void* old_ptr)
     allocator_arena_page_s* page = self->last_page;
     allocator_arena_rec_s* rec = _cex_alloc_arena__get_rec(old_ptr);
     while (page) {
-        var tpage = page->prev_page;
+        auto tpage = page->prev_page;
         if ((char*)rec > (char*)page &&
             (char*)rec < (((char*)page) + sizeof(allocator_arena_page_s) + page->capacity)) {
             uassert((char*)rec >= (char*)page + sizeof(allocator_arena_page_s));
@@ -4391,7 +6258,7 @@ _cex_allocator_arena__request_page_size(
         if (page_size == 0 || page_size > CEX_ARENA_MAX_ALLOC) {
             uassert(page_size > 0 && "page_size is zero");
             uassert(page_size <= CEX_ARENA_MAX_ALLOC && "page_size is to big");
-            return false;
+            return NULL;
         }
         allocator_arena_page_s*
             page = mem$->calloc(mem$, 1, page_size, alignof(allocator_arena_page_s));
@@ -4435,8 +6302,8 @@ _cex_allocator_arena__malloc(IAllocator allc, usize size, usize alignment)
 
     allocator_arena_rec_s* page_rec = (allocator_arena_rec_s*)&page->data[page->cursor];
     uassert((((usize)(page_rec) & ((8) - 1)) == 0) && "unaligned pointer");
-    _Static_assert(sizeof(allocator_arena_rec_s) == 8, "unexpected size");
-    _Static_assert(alignof(allocator_arena_rec_s) <= 8, "unexpected alignment");
+    static_assert(sizeof(allocator_arena_rec_s) == 8, "unexpected size");
+    static_assert(alignof(allocator_arena_rec_s) <= 8, "unexpected alignment");
 
     mem$asan_unpoison(page_rec, sizeof(allocator_arena_rec_s));
     *page_rec = rec;
@@ -4629,7 +6496,7 @@ _cex_allocator_arena__scope_exit(IAllocator allc)
 
     allocator_arena_page_s* page = self->last_page;
     while (page) {
-        var tpage = page->prev_page;
+        auto tpage = page->prev_page;
         if (page->used_start == 0 || page->used_start < used_mark) {
             // last page, just set mark and poison
             usize free_offset = (used_mark - page->used_start);
@@ -4779,7 +6646,7 @@ AllocatorArena_destroy(IAllocator self)
 
     allocator_arena_page_s* page = allc->last_page;
     while (page) {
-        var tpage = page->prev_page;
+        auto tpage = page->prev_page;
         mem$free(mem$, page);
         page = tpage;
     }
@@ -5009,7 +6876,7 @@ typedef struct
     usize hash[_CEXDS_BUCKET_LENGTH];
     ptrdiff_t index[_CEXDS_BUCKET_LENGTH];
 } _cexds__hash_bucket;
-_Static_assert(sizeof(_cexds__hash_bucket) % 64 == 0, "cacheline aligned");
+static_assert(sizeof(_cexds__hash_bucket) % 64 == 0, "cacheline aligned");
 
 typedef struct _cexds__hash_index
 {
@@ -5425,7 +7292,7 @@ _cexds__hmkey_ptr(void* a, usize elemsize, usize index, usize keyoffset)
             break;
         }
         default:
-            unreachable("Not implemented");
+            unreachable();
     }
     return key_data_p;
 }
@@ -7491,12 +9358,7 @@ _cex_str__index(str_s* s, char* c, u8 clen)
     return result;
 }
 
-/**
- * @brief Creates string slice of input C string (NULL tolerant, (str_s){0} on error)
- *
- * @param ccharptr pointer to a string
- * @return
- */
+/// Creates string slice of input C string (NULL tolerant, (str_s){0} on error)
 static str_s
 cex_str_sstr(char* ccharptr)
 {
@@ -7508,7 +9370,7 @@ cex_str_sstr(char* ccharptr)
     };
 }
 
-
+/// Creates string slice from a buf+len
 static str_s
 cex_str_sbuf(char* s, usize length)
 {
@@ -7520,6 +9382,7 @@ cex_str_sbuf(char* s, usize length)
     };
 }
 
+/// Compares two null-terminated strings (null tolerant)
 static bool
 cex_str_eq(char* a, char* b)
 {
@@ -7527,6 +9390,7 @@ cex_str_eq(char* a, char* b)
     return strcmp(a, b) == 0;
 }
 
+/// Compares two strings, case insensitive, null tolerant
 bool
 cex_str_eqi(char* a, char* b)
 {
@@ -7539,6 +9403,7 @@ cex_str_eqi(char* a, char* b)
     return (*a == '\0' && *b == '\0');
 }
 
+/// Compares two string slices, null tolerant
 static bool
 cex_str__slice__eq(str_s a, str_s b)
 {
@@ -7546,6 +9411,7 @@ cex_str__slice__eq(str_s a, str_s b)
     return str.slice.qscmp(&a, &b) == 0;
 }
 
+/// Compares two string slices, null tolerant, case insensitive
 static bool
 cex_str__slice__eqi(str_s a, str_s b)
 {
@@ -7553,18 +9419,37 @@ cex_str__slice__eqi(str_s a, str_s b)
     return str.slice.qscmpi(&a, &b) == 0;
 }
 
+/// Makes slices of `s` slice, start/end are indexes, can be negative from the end, if end=0 mean
+/// full length of the string. `s` may be not null-terminated. function is NULL tolerant, return
+/// (str_s){0} on error
 static str_s
 cex_str__slice__sub(str_s s, isize start, isize end)
 {
-    slice$define(*s.buf) slice = { 0 };
-    if (s.buf != NULL) { _arr$slice_get(slice, s.buf, s.len, start, end); }
+    str_s result = { 0 };
 
-    return (str_s){
-        .buf = slice.arr,
-        .len = slice.len,
-    };
+    if (s.buf != NULL) {
+        isize _len = s.len;
+        if (unlikely(start < 0)) { start += _len; }
+        if (end == 0) { /* _end=0 equivalent infinity */
+            end = _len;
+        } else if (unlikely(end < 0)) {
+            end += _len;
+        }
+        end = end < _len ? end : _len;
+        start = start > 0 ? start : 0;
+
+        if (start < end) {
+            result.buf = &(s.buf[start]);
+            result.len = (usize)(end - start);
+        }
+    }
+
+    return result;
 }
 
+/// Makes slices of `s` char* string, start/end are indexes, can be negative from the end, if end=0
+/// mean full length of the string. `s` may be not null-terminated. function is NULL tolerant,
+/// return (str_s){0} on error
 static str_s
 cex_str_sub(char* s, isize start, isize end)
 {
@@ -7572,6 +9457,8 @@ cex_str_sub(char* s, isize start, isize end)
     return cex_str__slice__sub(slice, start, end);
 }
 
+/// Makes a copy of initial `src`, into `dest` buffer constrained by `destlen`. NULL tolerant,
+/// always null-terminated, overflow checked.
 static Exception
 cex_str_copy(char* dest, char* src, usize destlen)
 {
@@ -7596,6 +9483,7 @@ cex_str_copy(char* dest, char* src, usize destlen)
     return Error.ok;
 }
 
+/// Replaces substring occurrence in a string
 char*
 cex_str_replace(char* s, char* old_sub, char* new_sub, IAllocator allc)
 {
@@ -7633,6 +9521,8 @@ cex_str_replace(char* s, char* old_sub, char* new_sub, IAllocator allc)
     return new_str;
 }
 
+/// Makes a copy of initial `src` slice, into `dest` buffer constrained by `destlen`. NULL tolerant,
+/// always null-terminated, overflow checked.
 static Exception
 cex_str__slice__copy(char* dest, str_s src, usize destlen)
 {
@@ -7647,6 +9537,7 @@ cex_str__slice__copy(char* dest, str_s src, usize destlen)
     return Error.ok;
 }
 
+/// Analog of vsprintf() uses CEX sprintf engine. NULL tolerant, overflow safe.
 static Exception
 cex_str_vsprintf(char* dest, usize dest_len, char* format, va_list va)
 {
@@ -7666,6 +9557,7 @@ cex_str_vsprintf(char* dest, usize dest_len, char* format, va_list va)
     return EOK;
 }
 
+/// Analog of sprintf() uses CEX sprintf engine. NULL tolerant, overflow safe.
 static Exc
 cex_str_sprintf(char* dest, usize dest_len, char* format, ...)
 {
@@ -7677,6 +9569,7 @@ cex_str_sprintf(char* dest, usize dest_len, char* format, ...)
 }
 
 
+/// Calculates string length, NULL tolerant.
 static usize
 cex_str_len(char* s)
 {
@@ -7684,6 +9577,7 @@ cex_str_len(char* s)
     return strlen(s);
 }
 
+/// Find a substring in a string, returns pointer to first element. NULL tolerant, and NULL on err.
 static char*
 cex_str_find(char* haystack, char* needle)
 {
@@ -7691,6 +9585,7 @@ cex_str_find(char* haystack, char* needle)
     return strstr(haystack, needle);
 }
 
+/// Find substring from the end , NULL tolerant, returns NULL on error.
 char*
 cex_str_findr(char* haystack, char* needle)
 {
@@ -7708,6 +9603,7 @@ cex_str_findr(char* haystack, char* needle)
     return NULL;
 }
 
+/// Get index of first occurrence of `needle`, returns -1 on error.
 static isize
 cex_str__slice__index_of(str_s s, str_s needle)
 {
@@ -7725,12 +9621,15 @@ cex_str__slice__index_of(str_s s, str_s needle)
     return -1;
 }
 
+/// Checks if slice starts with prefix, returns (str_s){0} on error, NULL tolerant
 static bool
 cex_str__slice__starts_with(str_s s, str_s prefix)
 {
     if (unlikely(!s.buf || !prefix.buf || prefix.len == 0 || prefix.len > s.len)) { return false; }
     return memcmp(s.buf, prefix.buf, prefix.len) == 0;
 }
+
+/// Checks if slice ends with prefix, returns (str_s){0} on error, NULL tolerant
 static bool
 cex_str__slice__ends_with(str_s s, str_s suffix)
 {
@@ -7738,6 +9637,7 @@ cex_str__slice__ends_with(str_s s, str_s suffix)
     return s.len >= suffix.len && !memcmp(s.buf + s.len - suffix.len, suffix.buf, suffix.len);
 }
 
+/// Checks if string starts with prefix, returns false on error, NULL tolerant
 static bool
 cex_str_starts_with(char* s, char* prefix)
 {
@@ -7747,6 +9647,7 @@ cex_str_starts_with(char* s, char* prefix)
     return *prefix == 0;
 }
 
+/// Checks if string ends with prefix, returns false on error, NULL tolerant
 static bool
 cex_str_ends_with(char* s, char* suffix)
 {
@@ -7757,6 +9658,7 @@ cex_str_ends_with(char* s, char* suffix)
     return slen >= sufflen && !memcmp(s + slen - sufflen, suffix, sufflen);
 }
 
+/// Replaces slice prefix (start part), or returns the same slice if it's not found
 static str_s
 cex_str__slice__remove_prefix(str_s s, str_s prefix)
 {
@@ -7768,6 +9670,7 @@ cex_str__slice__remove_prefix(str_s s, str_s prefix)
     };
 }
 
+/// Replaces slice suffix (end part), or returns the same slice if it's not found
 static str_s
 cex_str__slice__remove_suffix(str_s s, str_s suffix)
 {
@@ -7816,6 +9719,7 @@ cex_str__strip_right(str_s* s)
 }
 
 
+/// Removes white spaces from the beginning of slice
 static str_s
 cex_str__slice__lstrip(str_s s)
 {
@@ -7841,6 +9745,7 @@ cex_str__slice__lstrip(str_s s)
     return result;
 }
 
+/// Removes white spaces from the end of slice
 static str_s
 cex_str__slice__rstrip(str_s s)
 {
@@ -7866,6 +9771,8 @@ cex_str__slice__rstrip(str_s s)
     return result;
 }
 
+
+/// Removes white spaces from both ends of slice
 static str_s
 cex_str__slice__strip(str_s s)
 {
@@ -7892,6 +9799,7 @@ cex_str__slice__strip(str_s s)
     return result;
 }
 
+/// libc `qsort()` comparator function for alphabetical sorting of str_s arrays
 static int
 cex_str__slice__qscmp(const void* a, const void* b)
 {
@@ -7914,6 +9822,7 @@ cex_str__slice__qscmp(const void* a, const void* b)
     return cmp;
 }
 
+/// libc `qsort()` comparator function for alphabetical case insensitive sorting of str_s arrays
 static int
 cex_str__slice__qscmpi(const void* a, const void* b)
 {
@@ -7946,6 +9855,7 @@ cex_str__slice__qscmpi(const void* a, const void* b)
     return cmp;
 }
 
+/// iterator over slice splits:  for$iter (str_s, it, str.slice.iter_split(s, ",", &it.iterator)) {}
 static str_s
 cex_str__slice__iter_split(str_s s, char* split_by, cex_iterator_s* iterator)
 {
@@ -7959,8 +9869,8 @@ cex_str__slice__iter_split(str_s s, char* split_by, cex_iterator_s* iterator)
         usize split_by_len;
         usize str_len;
     }* ctx = (struct iter_ctx*)iterator->_ctx;
-    _Static_assert(sizeof(*ctx) <= sizeof(iterator->_ctx), "ctx size overflow");
-    _Static_assert(alignof(struct iter_ctx) <= alignof(usize), "cex_iterator_s _ctx misalign");
+    static_assert(sizeof(*ctx) <= sizeof(iterator->_ctx), "ctx size overflow");
+    static_assert(alignof(struct iter_ctx) <= alignof(usize), "cex_iterator_s _ctx misalign");
 
     if (unlikely(!iterator->initialized)) {
         iterator->initialized = 1;
@@ -8026,7 +9936,7 @@ cex_str__slice__iter_split(str_s s, char* split_by, cex_iterator_s* iterator)
 static Exception
 cex_str__to_signed_num(char* self, usize len, i64* num, i64 num_min, i64 num_max)
 {
-    _Static_assert(sizeof(i64) == 8, "unexpected u64 size");
+    static_assert(sizeof(i64) == 8, "unexpected u64 size");
     uassert(num_min < num_max);
     uassert(num_min <= 0);
     uassert(num_max > 0);
@@ -8106,7 +10016,7 @@ cex_str__to_signed_num(char* self, usize len, i64* num, i64 num_min, i64 num_max
 static Exception
 cex_str__to_unsigned_num(char* s, usize len, u64* num, u64 num_max)
 {
-    _Static_assert(sizeof(u64) == 8, "unexpected u64 size");
+    static_assert(sizeof(u64) == 8, "unexpected u64 size");
     uassert(num_max > 0);
     uassert(num_max > 64);
 
@@ -8181,7 +10091,7 @@ cex_str__to_unsigned_num(char* s, usize len, u64* num, u64 num_max)
 static Exception
 cex_str__to_double(char* self, usize len, double* num, i32 exp_min, i32 exp_max)
 {
-    _Static_assert(sizeof(double) == 8, "unexpected double precision");
+    static_assert(sizeof(double) == 8, "unexpected double precision");
     if (unlikely(self == NULL)) { return Error.argument; }
 
     char* s = self;
@@ -8371,7 +10281,7 @@ cex_str__convert__to_i16s(str_s s, i16* num)
 {
     uassert(num != NULL);
     i64 res = 0;
-    var r = cex_str__to_signed_num(s.buf, s.len, &res, INT16_MIN, INT16_MAX);
+    auto r = cex_str__to_signed_num(s.buf, s.len, &res, INT16_MIN, INT16_MAX);
     *num = res;
     return r;
 }
@@ -8381,7 +10291,7 @@ cex_str__convert__to_i32s(str_s s, i32* num)
 {
     uassert(num != NULL);
     i64 res = 0;
-    var r = cex_str__to_signed_num(s.buf, s.len, &res, INT32_MIN, INT32_MAX);
+    auto r = cex_str__to_signed_num(s.buf, s.len, &res, INT32_MIN, INT32_MAX);
     *num = res;
     return r;
 }
@@ -8393,7 +10303,7 @@ cex_str__convert__to_i64s(str_s s, i64* num)
     uassert(num != NULL);
     i64 res = 0;
     // NOTE:INT64_MIN+1 because negating of INT64_MIN leads to UB!
-    var r = cex_str__to_signed_num(s.buf, s.len, &res, INT64_MIN + 1, INT64_MAX);
+    auto r = cex_str__to_signed_num(s.buf, s.len, &res, INT64_MIN + 1, INT64_MAX);
     *num = res;
     return r;
 }
@@ -8551,6 +10461,7 @@ _cex_str__fmt_callback(char* buf, void* user, u32 len)
     return (ctx->buf != NULL) ? &ctx->buf[ctx->length] : ctx->tmp;
 }
 
+/// Formats string and allocates it dynamically using allocator, supports CEX format engine
 static char*
 cex_str_fmt(IAllocator allc, char* format, ...)
 {
@@ -8584,6 +10495,7 @@ cex_str_fmt(IAllocator allc, char* format, ...)
     return ctx.buf;
 }
 
+/// Clone slice into new char* allocated by `allc`, null tolerant, returns NULL on error.
 static char*
 cex_str__slice__clone(str_s s, IAllocator allc)
 {
@@ -8596,6 +10508,7 @@ cex_str__slice__clone(str_s s, IAllocator allc)
     return result;
 }
 
+/// Clones string using allocator, null tolerant, returns NULL on error.
 static char*
 cex_str_clone(char* s, IAllocator allc)
 {
@@ -8611,6 +10524,7 @@ cex_str_clone(char* s, IAllocator allc)
     return result;
 }
 
+/// Returns new lower case string, returns NULL on error, null tolerant
 static char*
 cex_str_lower(char* s, IAllocator allc)
 {
@@ -8626,6 +10540,7 @@ cex_str_lower(char* s, IAllocator allc)
     return result;
 }
 
+/// Returns new upper case string, returns NULL on error, null tolerant
 static char*
 cex_str_upper(char* s, IAllocator allc)
 {
@@ -8641,6 +10556,9 @@ cex_str_upper(char* s, IAllocator allc)
     return result;
 }
 
+/// Splits string using split_by (allows many) chars, returns new dynamic array of split char*
+/// tokens, allocates memory with allc, returns NULL on error. NULL tolerant. Items of array are
+/// cloned, so you need free them independently or better use arena or tmem$.
 static arr$(char*) cex_str_split(char* s, char* split_by, IAllocator allc)
 {
     str_s src = cex_str_sstr(s);
@@ -8656,6 +10574,9 @@ static arr$(char*) cex_str_split(char* s, char* split_by, IAllocator allc)
     return result;
 }
 
+/// Splits string by lines, result allocated by allc, as dynamic array of cloned lines, Returns NULL
+/// on error, NULL tolerant. Items of array are cloned, so you need free them independently or
+/// better use arena or tmem$. Supports \n or \r\n.
 static arr$(char*) cex_str_split_lines(char* s, IAllocator allc)
 {
     uassert(allc != NULL);
@@ -8688,6 +10609,7 @@ static arr$(char*) cex_str_split_lines(char* s, IAllocator allc)
     return result;
 }
 
+/// Joins string using a separator (join_by), NULL tolerant, returns NULL on error.
 static char*
 cex_str_join(char** str_arr, usize str_arr_len, char* join_by, IAllocator allc)
 {
@@ -8918,17 +10840,21 @@ _cex_str_match(char* str, isize str_len, char* pattern)
     return str_len == 0;
 }
 
+/// Slice pattern matching check (see ./cex help str$ for examples)
 static bool
 cex_str__slice__match(str_s s, char* pattern)
 {
     return _cex_str_match(s.buf, s.len, pattern);
 }
+
+/// String pattern matching check (see ./cex help str$ for examples)
 static bool
 cex_str_match(char* s, char* pattern)
 {
     return _cex_str_match(s, str.len(s), pattern);
 }
 
+/// libc `qsort()` comparator functions, for arrays of `char*`, sorting alphabetical
 static int
 cex_str_qscmp(const void* a, const void* b)
 {
@@ -8939,6 +10865,7 @@ cex_str_qscmp(const void* a, const void* b)
     return strcmp(_a, _b);
 }
 
+/// libc `qsort()` comparator functions, for arrays of `char*`, sorting alphabetical case insensitive
 static int
 cex_str_qscmpi(const void* a, const void* b)
 {
@@ -9043,24 +10970,38 @@ struct _sbuf__sprintf_ctx
     sbuf_head_s* head;
     char* buf;
     Exc err;
-    u32 count;
-    u32 length;
+    usize count;
+    usize length;
     char tmp[CEX_SPRINTF_MIN];
 };
 
 static inline sbuf_head_s*
 _sbuf__head(sbuf_c self)
 {
-    uassert(self != NULL);
+    if (unlikely(!self)) { return NULL; }
     sbuf_head_s* head = (sbuf_head_s*)(self - sizeof(sbuf_head_s));
 
     uassert(head->header.magic == 0xf00e && "not a sbuf_head_s / bad pointer");
-    uassert(head->capacity > 0 && "zero capacity or memory corruption");
     uassert(head->length <= head->capacity && "count > capacity");
     uassert(head->header.nullterm == 0 && "nullterm != 0");
 
     return head;
 }
+
+static inline void
+_sbuf__set_error(sbuf_head_s* head, Exc err)
+{
+    if (!head) { return; }
+    if (head->err) { return; }
+
+    head->err = err;
+    head->length = 0;
+    head->capacity = 0;
+
+    // nullterm string contents
+    *((char*)head + sizeof(sbuf_head_s)) = '\0';
+}
+
 static inline usize
 _sbuf__alloc_capacity(usize capacity)
 {
@@ -9072,7 +11013,7 @@ _sbuf__alloc_capacity(usize capacity)
         return capacity * 1.2;
     } else {
         // Round up to closest pow*2 int
-        u64 p = 4;
+        u64 p = 64;
         while (p < capacity) { p *= 2; }
         return p;
     }
@@ -9084,6 +11025,7 @@ _sbuf__grow_buffer(sbuf_c* self, u32 length)
 
     if (unlikely(head->allocator == NULL)) {
         // sbuf is static, bad luck, overflow
+        _sbuf__set_error(head, Error.overflow);
         return Error.overflow;
     }
 
@@ -9100,8 +11042,9 @@ _sbuf__grow_buffer(sbuf_c* self, u32 length)
     return Error.ok;
 }
 
+/// Creates new dynamic string builder backed by allocator
 static sbuf_c
-cex_sbuf_create(u32 capacity, IAllocator allocator)
+cex_sbuf_create(usize capacity, IAllocator allocator)
 {
     if (unlikely(allocator == NULL)) {
         uassert(allocator != NULL);
@@ -9130,15 +11073,8 @@ cex_sbuf_create(u32 capacity, IAllocator allocator)
     return self;
 }
 
-static sbuf_c
-cex_sbuf_create_temp(void)
-{
-    uassert(
-        tmem$->scope_depth(tmem$) > 0 && "trying create tmem$ allocator outside mem$scope(tmem$)"
-    );
-    return cex_sbuf_create(100, tmem$);
-}
 
+/// Creates dynamic string backed by static array
 static sbuf_c
 cex_sbuf_create_static(char* buf, usize buf_size)
 {
@@ -9171,73 +11107,63 @@ cex_sbuf_create_static(char* buf, usize buf_size)
     return self;
 }
 
-static Exception
-cex_sbuf_grow(sbuf_c* self, u32 new_capacity)
-{
-    sbuf_head_s* head = _sbuf__head(*self);
-    if (new_capacity <= head->capacity) {
-        // capacity is enough, no need to grow
-        return Error.ok;
-    }
-    return _sbuf__grow_buffer(self, new_capacity);
-}
 
-static void
-cex_sbuf_update_len(sbuf_c* self)
+
+/// Shrinks string length to new_length (fails when new_length > existing length)
+static Exc
+cex_sbuf_shrink(sbuf_c* self, usize new_length)
 {
     uassert(self != NULL);
     sbuf_head_s* head = _sbuf__head(*self);
+    if (unlikely(!head)) { return Error.runtime; }
+    if (unlikely(head->err)) { return head->err; }
 
-    uassert((*self)[head->capacity] == '\0' && "capacity null term smashed!");
+    if (unlikely(new_length > head->length)) {
+        _sbuf__set_error(head, Error.argument);
+        return Error.argument;
+    }
 
-    head->length = strlen(*self);
+    head->length = new_length;
     (*self)[head->length] = '\0';
+    return EOK;
 }
 
+/// Clears string
 static void
 cex_sbuf_clear(sbuf_c* self)
 {
-    uassert(self != NULL);
-    sbuf_head_s* head = _sbuf__head(*self);
-    head->length = 0;
-    (*self)[head->length] = '\0';
+    cex_sbuf_shrink(self, 0);
 }
 
-static void
-cex_sbuf_shrink(sbuf_c* self, u32 new_length)
-{
-    uassert(self != NULL);
-    sbuf_head_s* head = _sbuf__head(*self);
-    uassert(new_length <= head->length);
-    uassert(new_length <= head->capacity);
-    head->length = new_length;
-    (*self)[head->length] = '\0';
-}
-
+/// Returns string length from its metadata
 static u32
 cex_sbuf_len(sbuf_c* self)
 {
     uassert(self != NULL);
-    if (*self == NULL) { return 0; }
     sbuf_head_s* head = _sbuf__head(*self);
+    if (unlikely(head == NULL)) { return 0; }
     return head->length;
 }
 
+
+/// Returns string capacity from its metadata
 static u32
 cex_sbuf_capacity(sbuf_c* self)
 {
     uassert(self != NULL);
     sbuf_head_s* head = _sbuf__head(*self);
+    if (unlikely(head == NULL)) { return 0; }
     return head->capacity;
 }
 
+/// Destroys the string, deallocates the memory, or nullify static buffer.
 static sbuf_c
 cex_sbuf_destroy(sbuf_c* self)
 {
     uassert(self != NULL);
 
-    if (*self != NULL) {
-        sbuf_head_s* head = _sbuf__head(*self);
+    sbuf_head_s* head = _sbuf__head(*self);
+    if (head != NULL) {
 
         // NOTE: null-terminate string to avoid future usage,
         // it will appear as empty string if references anywhere else
@@ -9248,14 +11174,16 @@ cex_sbuf_destroy(sbuf_c* self)
         if (head->allocator != NULL) {
             // allocator is NULL for static sbuf
             mem$free(head->allocator, head);
+        } else {
+            // static buffer
+            memset(self, 0, sizeof(*self));
         }
-        memset(self, 0, sizeof(*self));
     }
     return NULL;
 }
 
 static char*
-_sbuf__sprintf_callback(char* buf, void* user, u32 len)
+_cex_sbuf_sprintf_callback(char* buf, void* user, u32 len)
 {
     struct _sbuf__sprintf_ctx* ctx = (struct _sbuf__sprintf_ctx*)user;
     sbuf_c sbuf = ((char*)ctx->head + sizeof(sbuf_head_s));
@@ -9298,11 +11226,14 @@ _sbuf__sprintf_callback(char* buf, void* user, u32 len)
     return ((ctx->count - ctx->length) >= CEX_SPRINTF_MIN) ? ctx->buf : ctx->tmp;
 }
 
-static Exception
+/// Append format va (using CEX formatting engine), always null-terminating
+static Exc
 cex_sbuf_appendfva(sbuf_c* self, char* format, va_list va)
 {
     if (unlikely(self == NULL)) { return Error.argument; }
     sbuf_head_s* head = _sbuf__head(*self);
+    if (unlikely(head == NULL)) { return Error.runtime; }
+    if (unlikely(head->err)) { return head->err; }
 
     struct _sbuf__sprintf_ctx ctx = {
         .head = head,
@@ -9313,9 +11244,9 @@ cex_sbuf_appendfva(sbuf_c* self, char* format, va_list va)
     };
 
     cexsp__vsprintfcb(
-        _sbuf__sprintf_callback,
+        _cex_sbuf_sprintf_callback,
         &ctx,
-        _sbuf__sprintf_callback(NULL, &ctx, 0),
+        _cex_sbuf_sprintf_callback(NULL, &ctx, 0),
         format,
         va
     );
@@ -9330,7 +11261,9 @@ cex_sbuf_appendfva(sbuf_c* self, char* format, va_list va)
     return ctx.err;
 }
 
-static Exception
+
+/// Append format (using CEX formatting engine)
+static Exc
 cex_sbuf_appendf(sbuf_c* self, char* format, ...)
 {
 
@@ -9341,13 +11274,19 @@ cex_sbuf_appendf(sbuf_c* self, char* format, ...)
     return result;
 }
 
-static Exception
+/// Append string to the builder
+static Exc
 cex_sbuf_append(sbuf_c* self, char* s)
 {
     uassert(self != NULL);
     sbuf_head_s* head = _sbuf__head(*self);
+    if (unlikely(head == NULL)) { return Error.runtime; }
 
-    if (unlikely(s == NULL)) { return Error.argument; }
+    if (unlikely(s == NULL)) {
+        _sbuf__set_error(head, "sbuf.append s=NULL");
+        return Error.argument;
+    }
+    if (head->err) { return head->err; }
 
     u32 length = head->length;
     u32 capacity = head->capacity;
@@ -9372,20 +11311,34 @@ cex_sbuf_append(sbuf_c* self, char* s)
     return Error.ok;
 }
 
-static bool
-cex_sbuf_isvalid(sbuf_c* self)
+/// Validate dynamic string state, with detailed Exception 
+static Exception
+cex_sbuf_validate(sbuf_c* self)
 {
-    if (self == NULL) { return false; }
-    if (*self == NULL) { return false; }
+    if (unlikely(self == NULL)) { return "NULL argument"; }
+    if (unlikely(*self == NULL)) { return "Memory error or already free'd"; }
 
     sbuf_head_s* head = (sbuf_head_s*)((char*)(*self) - sizeof(sbuf_head_s));
 
-    if (head->header.magic != 0xf00e) { return false; }
-    if (head->capacity == 0) { return false; }
-    if (head->length > head->capacity) { return false; }
-    if (head->header.nullterm != 0) { return false; }
+    if (unlikely(head->err)) { return head->err; }
+    if (unlikely(head->header.magic != 0xf00e)) { return "Bad magic or non sbuf_c* pointer type"; }
+    if (unlikely(head->capacity == 0)) { return "Zero capacity"; }
+    if (head->length > head->capacity) { return "Length > capacity"; }
+    if (head->header.nullterm != 0) { return "Missing null term in header"; }
 
-    return true;
+    return EOK;
+}
+
+
+/// Returns false if string invalid
+static bool
+cex_sbuf_isvalid(sbuf_c* self)
+{
+    if (cex_sbuf_validate(self)) {
+        return false;
+    } else {
+        return true;
+    }
 }
 
 const struct __cex_namespace__sbuf sbuf = {
@@ -9399,13 +11352,11 @@ const struct __cex_namespace__sbuf sbuf = {
     .clear = cex_sbuf_clear,
     .create = cex_sbuf_create,
     .create_static = cex_sbuf_create_static,
-    .create_temp = cex_sbuf_create_temp,
     .destroy = cex_sbuf_destroy,
-    .grow = cex_sbuf_grow,
     .isvalid = cex_sbuf_isvalid,
     .len = cex_sbuf_len,
     .shrink = cex_sbuf_shrink,
-    .update_len = cex_sbuf_update_len,
+    .validate = cex_sbuf_validate,
 
     // clang-format on
 };
@@ -9415,6 +11366,8 @@ const struct __cex_namespace__sbuf sbuf = {
 /*
 *                          src/io.c
 */
+#include <errno.h>
+#include <stdio.h>
 
 #ifdef _WIN32
 #    include <io.h>
@@ -9425,6 +11378,7 @@ const struct __cex_namespace__sbuf sbuf = {
 #    include <unistd.h>
 #endif
 
+/// Opens new file: io.fopen(&file, "file.txt", "r+")
 Exception
 cex_io_fopen(FILE** file, char* filename, char* mode)
 {
@@ -9453,6 +11407,8 @@ cex_io_fopen(FILE** file, char* filename, char* mode)
     return Error.ok;
 }
 
+
+/// Obtain file descriptor from FILE*
 int
 cex_io_fileno(FILE* file)
 {
@@ -9460,6 +11416,7 @@ cex_io_fileno(FILE* file)
     return fileno(file);
 }
 
+/// Check if current file supports ANSI colors and in interactive terminal mode
 bool
 cex_io_isatty(FILE* file)
 {
@@ -9473,6 +11430,7 @@ cex_io_isatty(FILE* file)
 #endif
 }
 
+/// Flush changes to file
 Exception
 cex_io_fflush(FILE* file)
 {
@@ -9486,6 +11444,7 @@ cex_io_fflush(FILE* file)
     }
 }
 
+/// Seek file position
 Exception
 cex_io_fseek(FILE* file, long offset, int whence)
 {
@@ -9503,6 +11462,7 @@ cex_io_fseek(FILE* file, long offset, int whence)
     }
 }
 
+/// Rewind file cursor at the beginning
 void
 cex_io_rewind(FILE* file)
 {
@@ -9510,6 +11470,7 @@ cex_io_rewind(FILE* file)
     rewind(file);
 }
 
+/// Returns current cursor position into `size` pointer
 Exception
 cex_io_ftell(FILE* file, usize* size)
 {
@@ -9529,6 +11490,7 @@ cex_io_ftell(FILE* file, usize* size)
     }
 }
 
+/// Return full file size, always 0 for NULL file or atty
 usize
 cex_io__file__size(FILE* file)
 {
@@ -9553,29 +11515,33 @@ cex_io__file__size(FILE* file)
 #endif
 }
 
-Exception
-cex_io_fread(FILE* file, void* restrict obj_buffer, usize obj_el_size, usize* obj_count)
+/// Read file contents into the buf, return nbytes read (can be < buff_len), 0 on EOF, negative on
+/// error (you may use os.get_last_error() for getting Exception for error, cross-platform )
+isize
+cex_io_fread(FILE* file, void* buff, usize buff_len)
 {
-    if (file == NULL) { return Error.argument; }
-    if (obj_buffer == NULL) { return Error.argument; }
-    if (obj_el_size == 0) { return Error.argument; }
-    if (obj_count == NULL || *obj_count == 0) { return Error.argument; }
+    uassert(file != NULL);
+    uassert(buff != NULL);
+    uassert(buff_len < PTRDIFF_MAX && "Must fit to isize max");
 
-    usize ret_count = fread(obj_buffer, obj_el_size, *obj_count, file);
+    if (unlikely(buff_len >= PTRDIFF_MAX)) {
+        return -1; // hard protecting even in production
+    }
 
-    if (ret_count != *obj_count) {
+    usize ret_count = fread(buff, 1, buff_len, file);
+
+    if (ret_count != buff_len) {
         if (ferror(file)) {
-            *obj_count = 0;
-            return Error.io;
-        } else {
-            *obj_count = ret_count;
-            return (ret_count == 0) ? Error.eof : Error.ok;
+            // NOTE: use os.get_last_error() to get platform specific error
+            return -1;
         }
     }
 
-    return Error.ok;
+    uassert(ret_count < PTRDIFF_MAX);
+    return ret_count;
 }
 
+/// Read all contents of the file, using allocator. You should free `s.buf` after.
 Exception
 cex_io_fread_all(FILE* file, str_s* s, IAllocator allc)
 {
@@ -9673,6 +11639,7 @@ fail:
     return result;
 }
 
+/// Reads line from a file into str_s buffer, allocates memory. You should free `s.buf` after.
 Exception
 cex_io_fread_line(FILE* file, str_s* s, IAllocator allc)
 {
@@ -9769,6 +11736,7 @@ fail:
     return result;
 }
 
+/// Prints formatted string to the file. Uses CEX printf() engine with special formatting.
 Exc
 cex_io_fprintf(FILE* stream, char* format, ...)
 {
@@ -9786,6 +11754,7 @@ cex_io_fprintf(FILE* stream, char* format, ...)
     }
 }
 
+/// Prints formatted string to stdout. Uses CEX printf() engine with special formatting.
 int
 cex_io_printf(char* format, ...)
 {
@@ -9796,27 +11765,28 @@ cex_io_printf(char* format, ...)
     return result;
 }
 
+/// Writes bytes to the file
 Exception
-cex_io_fwrite(FILE* file, void* restrict obj_buffer, usize obj_el_size, usize obj_count)
+cex_io_fwrite(FILE* file, void* buff, usize buff_len)
 {
     if (file == NULL) {
         uassert(file != NULL);
         return Error.argument;
     }
 
-    if (obj_buffer == NULL) { return Error.argument; }
-    if (obj_el_size == 0) { return Error.argument; }
-    if (obj_count == 0) { return Error.argument; }
+    if (buff == NULL) { return Error.argument; }
+    if (buff_len == 0) { return Error.argument; }
 
-    usize ret_count = fwrite(obj_buffer, obj_el_size, obj_count, file);
+    usize ret_count = fwrite(buff, 1, buff_len, file);
 
-    if (ret_count != obj_count) {
-        return Error.io;
+    if (ret_count != buff_len) {
+        return os.get_last_error();
     } else {
         return Error.ok;
     }
 }
 
+/// Writes new line to the file
 Exception
 cex_io__file__writeln(FILE* file, char* line)
 {
@@ -9837,6 +11807,7 @@ cex_io__file__writeln(FILE* file, char* line)
     return Error.ok;
 }
 
+/// Closes file and set it to NULL.
 void
 cex_io_fclose(FILE** file)
 {
@@ -9847,6 +11818,7 @@ cex_io_fclose(FILE** file)
 }
 
 
+/// Saves full `contents` in the file at `path`, using text mode. 
 Exception
 cex_io__file__save(char* path, char* contents)
 {
@@ -9859,7 +11831,7 @@ cex_io__file__save(char* path, char* contents)
 
     usize contents_len = strlen(contents);
     if (contents_len > 0) {
-        e$except_silent (err, cex_io_fwrite(file, contents, 1, contents_len)) {
+        e$except_silent (err, cex_io_fwrite(file, contents, contents_len)) {
             cex_io_fclose(&file);
             return err;
         }
@@ -9869,6 +11841,7 @@ cex_io__file__save(char* path, char* contents)
     return EOK;
 }
 
+/// Load full contents of the file at `path`, using text mode. Returns NULL on error.
 char*
 cex_io__file__load(char* path, IAllocator allc)
 {
@@ -9898,6 +11871,7 @@ end:
     return out_content.buf;
 }
 
+/// Reads line from file, allocates result. Returns NULL on error.
 char*
 cex_io__file__readln(FILE* file, IAllocator allc)
 {
@@ -10536,7 +12510,7 @@ cex_argparse_next(argparse_c* self)
     uassert(self != NULL);
     uassert(self->argv != NULL && "forgot argparse.parse() call?");
 
-    var result = self->argv[0];
+    auto result = self->argv[0];
     if (self->argc > 0) {
 
         if (self->_ctx.cpidx > 0) {
@@ -11508,6 +13482,7 @@ closedir(DIR* dirp)
 }
 #endif // _WIN32
 
+/// Sleep for `period_millisec` duration
 static void
 cex_os_sleep(u32 period_millisec)
 {
@@ -11518,8 +13493,9 @@ cex_os_sleep(u32 period_millisec)
 #endif
 }
 
+/// Get high performance monotonic timer value in seconds
 static f64
-cex_os_timer()
+cex_os_timer(void)
 {
 #ifdef _WIN32
     static LARGE_INTEGER frequency = { 0 };
@@ -11534,6 +13510,8 @@ cex_os_timer()
 #endif
 }
 
+/// Get last system API error as string representation (Exception compatible). Result content may be
+/// affected by OS locale settings.
 static Exc
 cex_os_get_last_error(void)
 {
@@ -11601,6 +13579,7 @@ cex_os_get_last_error(void)
 #endif
 }
 
+/// Renames file or directory
 static Exception
 cex_os__fs__rename(char* old_path, char* new_path)
 {
@@ -11616,6 +13595,7 @@ cex_os__fs__rename(char* old_path, char* new_path)
 #endif // _WIN32
 }
 
+/// Makes directory (no error if exists)
 static Exception
 cex_os__fs__mkdir(char* path)
 {
@@ -11633,6 +13613,7 @@ cex_os__fs__mkdir(char* path)
     return EOK;
 }
 
+/// Makes all directories in a path
 static Exception
 cex_os__fs__mkpath(char* path)
 {
@@ -11657,6 +13638,7 @@ cex_os__fs__mkpath(char* path)
     return EOK;
 }
 
+/// Returns cross-platform path stats information (see os_fs_stat_s)
 static os_fs_stat_s
 cex_os__fs__stat(char* path)
 {
@@ -11749,6 +13731,7 @@ cex_os__fs__stat(char* path)
 #endif
 }
 
+/// Removes file or empty directory (also see os.fs.remove_tree)
 static Exception
 cex_os__fs__remove(char* path)
 {
@@ -11771,6 +13754,7 @@ cex_os__fs__remove(char* path)
 #endif
 }
 
+/// Iterates over directory (can be recursive) using callback function
 Exception
 cex_os__fs__dir_walk(char* path, bool is_recursive, os_fs_dir_walk_f callback_fn, void* user_ctx)
 {
@@ -11818,7 +13802,7 @@ cex_os__fs__dir_walk(char* path, bool is_recursive, os_fs_dir_walk_f callback_fn
             goto end;
         }
 
-        var ftype = os.fs.stat(path_buf);
+        auto ftype = os.fs.stat(path_buf);
         if (!ftype.is_valid) {
             result = ftype.error;
             goto end;
@@ -11865,6 +13849,7 @@ _os__fs__remove_tree_walker(char* path, os_fs_stat_s ftype, void* user_ctx)
     return EOK;
 }
 
+/// Removes directory and all its contents recursively
 static Exception
 cex_os__fs__remove_tree(char* path)
 {
@@ -11908,6 +13893,8 @@ _os__fs__copy_tree_walker(char* path, os_fs_stat_s ftype, void* user_ctx)
     return EOK;
 }
 
+
+/// Copy directory recursively
 static Exception
 cex_os__fs__copy_tree(char* src_dir, char* dst_dir)
 {
@@ -11960,25 +13947,27 @@ _os__fs__find_walker(char* path, os_fs_stat_s ftype, void* user_ctx)
     return EOK;
 }
 
-static arr$(char*) cex_os__fs__find(char* path, bool is_recursive, IAllocator allc)
+/// Finds files in `dir/pattern`, for example "./mydir/*.c" (all c files), if is_recursive=true, all
+/// *.c files found in sub-directories.
+static arr$(char*) cex_os__fs__find(char* path_pattern, bool is_recursive, IAllocator allc)
 {
 
     if (unlikely(allc == NULL)) { return NULL; }
 
-    str_s dir_part = os.path.split(path, true);
+    str_s dir_part = os.path.split(path_pattern, true);
     if (dir_part.buf == NULL) {
 #if defined(CEX_TEST) || defined(CEX_BUILD)
-        (void)e$raise(Error.argument, "Bad path: os.fn.find('%s')", path);
+        (void)e$raise(Error.argument, "Bad path: os.fn.find('%s')", path_pattern);
 #endif
         return NULL;
     }
 
     if (!is_recursive) {
-        var f = os.fs.stat(path);
+        auto f = os.fs.stat(path_pattern);
         if (f.is_valid && f.is_file) {
             // Find used with exact file path, we still have to return array + allocated path copy
             arr$(char*) result = arr$new(result, allc);
-            char* it = str.clone(path, allc);
+            char* it = str.clone(path_pattern, allc);
             arr$push(result, it);
             return result;
         }
@@ -11991,7 +13980,7 @@ static arr$(char*) cex_os__fs__find(char* path, bool is_recursive, IAllocator al
     }
     if (str.copy(
             path_buf + dir_part.len + 1,
-            path + dir_part.len,
+            path_pattern + dir_part.len,
             sizeof(path_buf) - dir_part.len - 1
         )) {
         uassert(dir_part.len < PATH_MAX);
@@ -12017,6 +14006,8 @@ static arr$(char*) cex_os__fs__find(char* path, bool is_recursive, IAllocator al
     return ctx.result;
 }
 
+
+/// Get current working directory
 static char*
 cex_os__fs__getcwd(IAllocator allc)
 {
@@ -12033,6 +14024,7 @@ cex_os__fs__getcwd(IAllocator allc)
     return result;
 }
 
+/// Change current working directory
 static Exception
 cex_os__fs__chdir(char* path)
 {
@@ -12057,6 +14049,7 @@ cex_os__fs__chdir(char* path)
 }
 
 
+/// Copy file
 static Exception
 cex_os__fs__copy(char* src_path, char* dst_path)
 {
@@ -12123,6 +14116,7 @@ defer:
 #endif
 }
 
+/// Get environment variable, with `deflt` if not found
 static char*
 cex_os__env__get(char* name, char* deflt)
 {
@@ -12133,6 +14127,7 @@ cex_os__env__get(char* name, char* deflt)
     return result;
 }
 
+/// Set environment variable
 static Exception
 cex_os__env__set(char* name, char* value)
 {
@@ -12145,13 +14140,15 @@ cex_os__env__set(char* name, char* value)
     return EOK;
 }
 
+/// Check if file/directory path exists
 static bool
 cex_os__path__exists(char* file_path)
 {
-    var ftype = os.fs.stat(file_path);
+    auto ftype = os.fs.stat(file_path);
     return ftype.is_valid;
 }
 
+/// Returns absolute path from relative
 static char*
 cex_os__path__abs(char* path, IAllocator allc)
 {
@@ -12170,6 +14167,7 @@ cex_os__path__abs(char* path, IAllocator allc)
     return str.clone(buffer, allc);
 }
 
+/// Join path with OS specific path separator
 static char*
 cex_os__path__join(char** parts, u32 parts_len, IAllocator allc)
 {
@@ -12177,6 +14175,8 @@ cex_os__path__join(char** parts, u32 parts_len, IAllocator allc)
     return str.join(parts, parts_len, sep, allc);
 }
 
+/// Splits path by `dir` and `file` parts, when return_dir=true - returns `dir` part, otherwise
+/// `file` part
 static str_s
 cex_os__path__split(char* path, bool return_dir)
 {
@@ -12212,6 +14212,7 @@ cex_os__path__split(char* path, bool return_dir)
     }
 }
 
+/// Get file name of a path
 static char*
 cex_os__path__basename(char* path, IAllocator allc)
 {
@@ -12220,6 +14221,7 @@ cex_os__path__basename(char* path, IAllocator allc)
     return str.slice.clone(fname, allc);
 }
 
+/// Get directory name of a path
 static char*
 cex_os__path__dirname(char* path, IAllocator allc)
 {
@@ -12228,6 +14230,8 @@ cex_os__path__dirname(char* path, IAllocator allc)
     return str.slice.clone(fname, allc);
 }
 
+
+/// Creates new os command (use os$cmd() and os$cmd() for easy cases). flags can be NULL.
 static Exception
 cex_os__cmd__create(os_cmd_c* self, char** args, usize args_len, os_cmd_flags_s* flags)
 {
@@ -12257,12 +14261,14 @@ cex_os__cmd__create(os_cmd_c* self, char** args, usize args_len, os_cmd_flags_s*
     return EOK;
 }
 
+/// Checks if process is running
 static bool
 cex_os__cmd__is_alive(os_cmd_c* self)
 {
     return subprocess_alive(&self->_subpr);
 }
 
+/// Terminates the running process
 static Exception
 cex_os__cmd__kill(os_cmd_c* self)
 {
@@ -12272,6 +14278,8 @@ cex_os__cmd__kill(os_cmd_c* self)
     return EOK;
 }
 
+/// Waits process to end, and get `out_ret_code`, if timeout_sec=0 - infinite wait, raises
+/// Error.runtime if out_ret_code != 0
 static Exception
 cex_os__cmd__join(os_cmd_c* self, u32 timeout_sec, i32* out_ret_code)
 {
@@ -12325,24 +14333,28 @@ end:
     return result;
 }
 
+/// Get running command stdout stream
 static FILE*
 cex_os__cmd__fstdout(os_cmd_c* self)
 {
     return self->_subpr.stdout_file;
 }
 
+/// Get running command stderr stream
 static FILE*
 cex_os__cmd__fstderr(os_cmd_c* self)
 {
     return self->_subpr.stderr_file;
 }
 
+/// Get running command stdin stream
 static FILE*
 cex_os__cmd__fstdin(os_cmd_c* self)
 {
     return self->_subpr.stdin_file;
 }
 
+/// Read all output from process stdout, NULL if stdout is not available
 static char*
 cex_os__cmd__read_all(os_cmd_c* self, IAllocator allc)
 {
@@ -12356,6 +14368,7 @@ cex_os__cmd__read_all(os_cmd_c* self, IAllocator allc)
     return NULL;
 }
 
+/// Read line from process stdout, NULL if stdout is not available
 static char*
 cex_os__cmd__read_line(os_cmd_c* self, IAllocator allc)
 {
@@ -12369,6 +14382,7 @@ cex_os__cmd__read_line(os_cmd_c* self, IAllocator allc)
     return NULL;
 }
 
+/// Writes line to the process stdin
 static Exception
 cex_os__cmd__write_line(os_cmd_c* self, char* line)
 {
@@ -12383,6 +14397,8 @@ cex_os__cmd__write_line(os_cmd_c* self, char* line)
     return EOK;
 }
 
+/// Check if `cmd_exe` program name exists in PATH. cmd_exe can be absolute, or simple command name,
+/// e.g. `cat`
 static bool
 cex_os__cmd__exists(char* cmd_exe)
 {
@@ -12444,6 +14460,7 @@ cex_os__cmd__exists(char* cmd_exe)
     return false;
 }
 
+/// Run command using arguments array and resulting os_cmd_c
 static Exception
 cex_os__cmd__run(char** args, usize args_len, os_cmd_c* out_cmd)
 {
@@ -12546,6 +14563,8 @@ end:
 #endif
 }
 
+/// Returns current OS platform, returns enum of OSPlatform__*, e.g. OSPlatform__win,
+/// OSPlatform__linux, OSPlatform__macos, etc..
 static OSPlatform_e
 cex_os__platform__current(void)
 {
@@ -12574,12 +14593,14 @@ cex_os__platform__current(void)
 #endif
 }
 
+/// Returns string name of current platform
 static char*
 cex_os__platform__current_str(void)
 {
     return os.platform.to_str(os.platform.current());
 }
 
+/// Converts platform name to enum
 static OSPlatform_e
 cex_os__platform__from_str(char* name)
 {
@@ -12591,6 +14612,7 @@ cex_os__platform__from_str(char* name)
     ;
 }
 
+/// Converts platform enum to name
 static char*
 cex_os__platform__to_str(OSPlatform_e platform)
 {
@@ -12598,6 +14620,7 @@ cex_os__platform__to_str(OSPlatform_e platform)
     return (char*)OSPlatform_str[platform];
 }
 
+/// Returns OSArch from string
 static OSArch_e
 cex_os__platform__arch_from_str(char* name)
 {
@@ -12609,6 +14632,7 @@ cex_os__platform__arch_from_str(char* name)
     ;
 }
 
+/// Converts arch to string
 static char*
 cex_os__platform__arch_to_str(OSArch_e platform)
 {
@@ -12683,535 +14707,8 @@ const struct __cex_namespace__os os = {
 
 
 /*
-*                          src/test.c
-*/
-#ifdef CEX_TEST
-#    include <math.h>
-
-enum _cex_test_eq_op_e
-{
-    _cex_test_eq_op__na,
-    _cex_test_eq_op__eq,
-    _cex_test_eq_op__ne,
-    _cex_test_eq_op__lt,
-    _cex_test_eq_op__le,
-    _cex_test_eq_op__gt,
-    _cex_test_eq_op__ge,
-};
-
-static Exc __attribute__((noinline))
-_check_eq_int(i64 a, i64 b, int line, enum _cex_test_eq_op_e op)
-{
-    extern struct _cex_test_context_s _cex_test__mainfn_state;
-    bool passed = false;
-    char* ops = "?";
-    switch (op) {
-        case _cex_test_eq_op__na:
-            unreachable("bad op");
-            break;
-        case _cex_test_eq_op__eq:
-            passed = a == b;
-            ops = "!=";
-            break;
-        case _cex_test_eq_op__ne:
-            passed = a != b;
-            ops = "==";
-            break;
-        case _cex_test_eq_op__lt:
-            passed = a < b;
-            ops = ">=";
-            break;
-        case _cex_test_eq_op__le:
-            passed = a <= b;
-            ops = ">";
-            break;
-        case _cex_test_eq_op__gt:
-            passed = a > b;
-            ops = "<=";
-            break;
-        case _cex_test_eq_op__ge:
-            passed = a >= b;
-            ops = "<";
-            break;
-    }
-    if (!passed) {
-        str.sprintf(
-            _cex_test__mainfn_state.str_buf,
-            sizeof(_cex_test__mainfn_state.str_buf),
-            "%s:%d -> %ld %s %ld",
-            _cex_test__mainfn_state.suite_file,
-            line,
-            a,
-            ops,
-            b
-        );
-        return _cex_test__mainfn_state.str_buf;
-    }
-    return EOK;
-}
-
-static Exc __attribute__((noinline))
-_check_eq_almost(f64 a, f64 b, f64 delta, int line)
-{
-    extern struct _cex_test_context_s _cex_test__mainfn_state;
-    bool passed = false;
-    f64 abdelta = a - b;
-    if (isnan(a) && isnan(b)) {
-        passed = true;
-    } else if (isinf(a) && isinf(b)) {
-        passed = (signbit(a) == signbit(b));
-    } else {
-        passed = fabs(abdelta) <= ((delta != 0) ? delta : (f64)0.0000001);
-    }
-    if (!passed) {
-        str.sprintf(
-            _cex_test__mainfn_state.str_buf,
-            sizeof(_cex_test__mainfn_state.str_buf),
-            "%s:%d -> %f != %f (delta: %f, diff: %f)",
-            _cex_test__mainfn_state.suite_file,
-            line,
-            (a),
-            (b),
-            delta,
-            abdelta
-        );
-        return _cex_test__mainfn_state.str_buf;
-    }
-    return EOK;
-}
-
-static Exc __attribute__((noinline))
-_check_eq_f32(f64 a, f64 b, int line, enum _cex_test_eq_op_e op)
-{
-    (void)op;
-    extern struct _cex_test_context_s _cex_test__mainfn_state;
-    bool passed = false;
-    char* ops = "?";
-    f64 delta = a - b;
-    bool is_equal = false;
-
-    if (isnan(a) && isnan(b)) {
-        is_equal = true;
-    } else if (isinf(a) && isinf(b)) {
-        is_equal = (signbit(a) == signbit(b));
-    } else {
-        is_equal = fabs(delta) <= (f64)0.0000001;
-    }
-    switch (op) {
-        case _cex_test_eq_op__na:
-            unreachable("bad op");
-            break;
-        case _cex_test_eq_op__eq:
-            passed = is_equal;
-            ops = "!=";
-            break;
-        case _cex_test_eq_op__ne:
-            passed = !is_equal;
-            ops = "==";
-            break;
-        case _cex_test_eq_op__lt:
-            passed = a < b;
-            ops = ">=";
-            break;
-        case _cex_test_eq_op__le:
-            passed = a < b || is_equal;
-            ops = ">";
-            break;
-        case _cex_test_eq_op__gt:
-            passed = a > b;
-            ops = "<=";
-            break;
-        case _cex_test_eq_op__ge:
-            passed = a >= b || is_equal;
-            ops = "<";
-            break;
-    }
-    if (!passed) {
-        str.sprintf(
-            _cex_test__mainfn_state.str_buf,
-            sizeof(_cex_test__mainfn_state.str_buf),
-            "%s:%d -> %f %s %f (delta: %f)",
-            _cex_test__mainfn_state.suite_file,
-            line,
-            a,
-            ops,
-            b,
-            delta
-        );
-        return _cex_test__mainfn_state.str_buf;
-    }
-    return EOK;
-}
-
-static Exc __attribute__((noinline))
-_check_eq_str(char* a, char* b, int line, enum _cex_test_eq_op_e op)
-{
-    bool passed = false;
-    char* ops = "";
-    switch (op) {
-        case _cex_test_eq_op__eq:
-            passed = str.eq(a, b);
-            ops = "!=";
-            break;
-        case _cex_test_eq_op__ne:
-            passed = !str.eq(a, b);
-            ops = "==";
-            break;
-        default:
-            unreachable("bad op or unsupported for strings");
-    }
-    extern struct _cex_test_context_s _cex_test__mainfn_state;
-    if (!passed) {
-        str.sprintf(
-            _cex_test__mainfn_state.str_buf,
-            CEX_TEST_AMSG_MAX_LEN - 1,
-            "%s:%d -> '%s' %s '%s'",
-            _cex_test__mainfn_state.suite_file,
-            line,
-            a,
-            ops,
-            b
-        );
-        return _cex_test__mainfn_state.str_buf;
-    }
-    return EOK;
-}
-
-static Exc __attribute__((noinline))
-_check_eq_err(char* a, char* b, int line)
-{
-    extern struct _cex_test_context_s _cex_test__mainfn_state;
-    if (!str.eq(a, b)) {
-        char* ea = (a == EOK) ? "Error.ok" : a;
-        char* eb = (b == EOK) ? "Error.ok" : b;
-        str.sprintf(
-            _cex_test__mainfn_state.str_buf,
-            CEX_TEST_AMSG_MAX_LEN - 1,
-            "%s:%d -> Exc mismatch '%s' != '%s'",
-            _cex_test__mainfn_state.suite_file,
-            line,
-            ea,
-            eb
-        );
-        return _cex_test__mainfn_state.str_buf;
-    }
-    return EOK;
-}
-
-
-static Exc __attribute__((noinline))
-_check_eq_ptr(void* a, void* b, int line)
-{
-    extern struct _cex_test_context_s _cex_test__mainfn_state;
-    if (a != b) {
-        str.sprintf(
-            _cex_test__mainfn_state.str_buf,
-            CEX_TEST_AMSG_MAX_LEN - 1,
-            "%s:%d -> %p != %p (ptr_diff: %ld)",
-            _cex_test__mainfn_state.suite_file,
-            line,
-            a,
-            b,
-            (a - b)
-        );
-        return _cex_test__mainfn_state.str_buf;
-    }
-    return EOK;
-}
-
-static Exc __attribute__((noinline))
-_check_eqs_slice(str_s a, str_s b, int line, enum _cex_test_eq_op_e op)
-{
-    bool passed = false;
-    char* ops = "";
-    switch (op) {
-        case _cex_test_eq_op__eq:
-            passed = str.slice.eq(a, b);
-            ops = "!=";
-            break;
-        case _cex_test_eq_op__ne:
-            passed = !str.slice.eq(a, b);
-            ops = "==";
-            break;
-        default:
-            unreachable("bad op or unsupported for strings");
-    }
-    extern struct _cex_test_context_s _cex_test__mainfn_state;
-    if (!passed) {
-        if (str.sprintf(
-                _cex_test__mainfn_state.str_buf,
-                CEX_TEST_AMSG_MAX_LEN - 1,
-                "%s:%d -> '%S' %s '%S'",
-                _cex_test__mainfn_state.suite_file,
-                line,
-                a,
-                ops,
-                b
-            )) {}
-        return _cex_test__mainfn_state.str_buf;
-    }
-    return EOK;
-}
-
-static void __attribute__((noinline))
-cex_test_mute()
-{
-    extern struct _cex_test_context_s _cex_test__mainfn_state;
-    struct _cex_test_context_s* ctx = &_cex_test__mainfn_state;
-    if (ctx->out_stream) {
-        fflush(stdout);
-        io.rewind(ctx->out_stream);
-        fflush(ctx->out_stream);
-        dup2(fileno(ctx->out_stream), STDOUT_FILENO);
-    }
-}
-static void __attribute__((noinline))
-cex_test_unmute(Exc test_result)
-{
-    (void)test_result;
-    extern struct _cex_test_context_s _cex_test__mainfn_state;
-    struct _cex_test_context_s* ctx = &_cex_test__mainfn_state;
-    if (ctx->out_stream) {
-        fflush(stdout);
-        putc('\0', stdout);
-        fflush(stdout);
-        isize flen = io.file.size(ctx->out_stream);
-        io.rewind(ctx->out_stream);
-        dup2(ctx->orig_stdout_fd, STDOUT_FILENO);
-
-        if (test_result != EOK && flen > 1) {
-            fflush(stdout);
-            fflush(stderr);
-            fprintf(stderr, "\n============== TEST OUTPUT >>>>>>>=============\n\n");
-            int c;
-            while ((c = fgetc(ctx->out_stream)) != EOF && c != '\0') { putc(c, stderr); }
-            fprintf(stderr, "\n============== <<<<<< TEST OUTPUT =============\n");
-        }
-    }
-}
-
-
-static int __attribute__((noinline))
-cex_test_main_fn(int argc, char** argv)
-{
-    (void)argc;
-    (void)argv;
-    extern struct _cex_test_context_s _cex_test__mainfn_state;
-
-    struct _cex_test_context_s* ctx = &_cex_test__mainfn_state;
-    if (ctx->test_cases == NULL) {
-        fprintf(stderr, "No test$case() in the test file: %s\n", __FILE__);
-        return 1;
-    }
-    u32 max_name = 0;
-    for$each (t, ctx->test_cases) {
-        if (max_name < strlen(t.test_name) + 2) { max_name = strlen(t.test_name) + 2; }
-    }
-    max_name = (max_name < 70) ? 70 : max_name;
-
-    ctx->quiet_mode = false;
-    ctx->has_ansi = io.isatty(stdout);
-
-    argparse_opt_s options[] = {
-        argparse$opt_help(),
-        argparse$opt(&ctx->case_filter, 'f', "filter", .help = "execute cases with filter"),
-        argparse$opt(&ctx->quiet_mode, 'q', "quiet", .help = "run test in quiet_mode"),
-        argparse$opt(&ctx->breakpoint, 'b', "breakpoint", .help = "breakpoint on tassert failure"),
-        argparse$opt(
-            &ctx->no_stdout_capture,
-            'o',
-            "no-capture",
-            .help = "prints all stdout as test goes"
-        ),
-    };
-
-    argparse_c args = {
-        .options = options,
-        .options_len = arr$len(options),
-        .description = "Test runner program",
-    };
-
-    e$except_silent (err, argparse.parse(&args, argc, argv)) { return 1; }
-
-    if (!ctx->no_stdout_capture) {
-        ctx->out_stream = tmpfile();
-        if (ctx->out_stream == NULL) {
-            fprintf(stderr, "Failed opening temp output for capturing tests\n");
-            uassert(false && "TODO: test this");
-        }
-    }
-
-    ctx->orig_stdout_fd = dup(fileno(stdout));
-
-    mem$scope(tmem$, _)
-    {
-        void* data = mem$malloc(_, 120);
-        (void)data;
-        uassert(data != NULL && "priming temp allocator failed");
-    }
-
-    if (!ctx->quiet_mode) {
-        fprintf(stderr, "-------------------------------------\n");
-        fprintf(stderr, "Running Tests: %s\n", argv[0]);
-        fprintf(stderr, "-------------------------------------\n\n");
-    }
-    if (ctx->setup_suite_fn) {
-        Exc err = NULL;
-        if ((err = ctx->setup_suite_fn())) {
-            fprintf(
-                stderr,
-                "[%s] test$setup_suite() failed with %s (suite %s stopped)\n",
-                ctx->has_ansi ? io$ansi("FAIL", "31") : "FAIL",
-                err,
-                __FILE__
-            );
-            return 1;
-        }
-    }
-
-    if (ctx->quiet_mode) { fprintf(stderr, "%s ", ctx->suite_file); }
-
-    for$each (t, ctx->test_cases) {
-        ctx->case_name = t.test_name;
-        ctx->tests_run++;
-        if (ctx->case_filter && !str.find(t.test_name, ctx->case_filter)) { continue; }
-
-        if (!ctx->quiet_mode) {
-            fprintf(stderr, "%s", t.test_name);
-            for (u32 i = 0; i < max_name - strlen(t.test_name) + 2; i++) { putc('.', stderr); }
-            if (ctx->no_stdout_capture) { putc('\n', stderr); }
-        }
-
-#    ifndef NDEBUG
-        uassert_enable(); // unconditionally enable previously disabled asserts
-#    endif
-        Exc err = EOK;
-        AllocatorHeap_c* alloc_heap = (AllocatorHeap_c*)mem$;
-        alloc_heap->stats.n_allocs = 0;
-        alloc_heap->stats.n_free = 0;
-
-        if (ctx->setup_case_fn && (err = ctx->setup_case_fn()) != EOK) {
-            fflush(stdout);
-            fprintf(
-                stderr,
-                "[%s] test$setup() failed with '%s' (suite %s stopped)\n",
-                ctx->has_ansi ? io$ansi("FAIL", "31") : "FAIL",
-                err,
-                __FILE__
-            );
-            return 1;
-        }
-
-        cex_test_mute();
-        err = t.test_fn();
-        if (ctx->quiet_mode && err != EOK) {
-            fprintf(stdout, "[%s] %s\n", ctx->has_ansi ? io$ansi("FAIL", "31") : "FAIL", err);
-            fprintf(stdout, "Test suite: %s case: %s\n", ctx->suite_file, t.test_name);
-        }
-        cex_test_unmute(err);
-
-        if (err == EOK) {
-            if (ctx->quiet_mode) {
-                fprintf(stderr, ".");
-            } else {
-                fprintf(stderr, "[%s]\n", ctx->has_ansi ? io$ansi("PASS", "32") : "PASS");
-            }
-        } else {
-            ctx->tests_failed++;
-            if (!ctx->quiet_mode) {
-                fprintf(
-                    stderr,
-                    "[%s] %s (%s)\n",
-                    ctx->has_ansi ? io$ansi("FAIL", "31") : "FAIL",
-                    err,
-                    t.test_name
-                );
-            } else {
-                fprintf(stderr, "F");
-            }
-        }
-        if (ctx->teardown_case_fn && (err = ctx->teardown_case_fn()) != EOK) {
-            fflush(stdout);
-            fprintf(
-                stderr,
-                "[%s] test$teardown() failed with %s (suite %s stopped)\n",
-                ctx->has_ansi ? io$ansi("FAIL", "31") : "FAIL",
-                err,
-                __FILE__
-            );
-            return 1;
-        }
-        if (err == EOK && alloc_heap->stats.n_allocs != alloc_heap->stats.n_free) {
-            if (!ctx->quiet_mode) {
-                fprintf(stderr, "%s", t.test_name);
-                for (u32 i = 0; i < max_name - strlen(t.test_name) + 2; i++) { putc('.', stderr); }
-            } else {
-                putc('\n', stderr);
-            }
-            fprintf(
-                stderr,
-                "[%s] %s:%d Possible memory leak: allocated %d != free %d\n",
-                ctx->has_ansi ? io$ansi("LEAK", "33") : "LEAK",
-                ctx->suite_file,
-                t.test_line,
-                alloc_heap->stats.n_allocs,
-                alloc_heap->stats.n_free
-            );
-            ctx->tests_failed++;
-        }
-    }
-
-    if (ctx->teardown_suite_fn) {
-        e$except (err, ctx->teardown_suite_fn()) {
-            fprintf(
-                stderr,
-                "[%s] test$teardown_suite() failed with %s (suite %s stopped)\n",
-                ctx->has_ansi ? io$ansi("FAIL", "31") : "FAIL",
-                err,
-                __FILE__
-            );
-            return 1;
-        }
-    }
-
-    if (!ctx->quiet_mode) {
-        fprintf(stderr, "\n-------------------------------------\n");
-        fprintf(
-            stderr,
-            "Total: %d Passed: %d Failed: %d\n",
-            ctx->tests_run,
-            ctx->tests_run - ctx->tests_failed,
-            ctx->tests_failed
-        );
-        fprintf(stderr, "-------------------------------------\n");
-    } else {
-        fprintf(stderr, "\n");
-
-        if (ctx->tests_failed) {
-            fprintf(
-                stderr,
-                "\n[%s] %s %d tests failed\n",
-                (ctx->has_ansi ? io$ansi("FAIL", "31") : "FAIL"),
-                ctx->suite_file,
-                ctx->tests_failed
-            );
-        }
-    }
-
-    if (ctx->out_stream) {
-        fclose(ctx->out_stream);
-        ctx->out_stream = NULL;
-    }
-    return ctx->tests_run == 0 || ctx->tests_failed > 0;
-}
-#endif // ifdef CEX_TEST
-
-
-
-/*
 *                          src/cex_code_gen.c
 */
-#if defined(CEX_BUILD) || defined(CEX_NEW)
 
 void
 _cex__codegen_indent(_cex__codegen_s* cg)
@@ -13298,13 +14795,14 @@ _cex__codegen_print_case_exit(_cex__codegen_s** cgptr)
 }
 
 #    undef cg$printva
-#endif // #ifdef CEX_BUILD
 
 
 
 /*
 *                          src/cexy.c
 */
+#include <stdbool.h>
+#include <stdio.h>
 #if defined(CEX_BUILD) || defined(CEX_NEW)
 
 #    include <ctype.h>
@@ -13379,7 +14877,7 @@ cexy_build_self(int argc, char** argv, char* cex_source)
                 if (clean_it.len == 0) { continue; }
                 if (!str.slice.starts_with(clean_it, str$s("-D"))) { continue; }
                 if (str.slice.eq(clean_it, str$s("-D"))) { continue; }
-                var _darg = str.fmt(_, "%S", clean_it);
+                auto _darg = str.fmt(_, "%S", clean_it);
                 arr$push(args, _darg);
                 e$goto(sbuf.appendf(&dargs_sbuf, "%s ", _darg), err);
             }
@@ -13432,7 +14930,7 @@ cexy_src_include_changed(char* target_path, char* src_path, arr$(char*) alt_incl
         return false;
     }
 
-    var src_meta = os.fs.stat(src_path);
+    auto src_meta = os.fs.stat(src_path);
     if (!src_meta.is_valid) {
         (void)e$raise(src_meta.error, "Error src: %s", src_path);
         return false;
@@ -13441,7 +14939,7 @@ cexy_src_include_changed(char* target_path, char* src_path, arr$(char*) alt_incl
         return false;
     }
 
-    var target_meta = os.fs.stat(target_path);
+    auto target_meta = os.fs.stat(target_path);
     if (!target_meta.is_valid) {
         if (target_meta.error == Error.not_found) {
             return true;
@@ -13533,7 +15031,7 @@ cexy_src_include_changed(char* target_path, char* src_path, arr$(char*) alt_incl
                         for$each (inc_dir, incl_path) {
                             char* try_path = os$path_join(_, inc_dir, inc_fn);
                             uassert(try_path != NULL);
-                            var src_meta = os.fs.stat(try_path);
+                            auto src_meta = os.fs.stat(try_path);
                             log$trace("Probing include: %s\n", try_path);
                             if (src_meta.is_valid && src_meta.mtime > target_meta.mtime) {
                                 return true;
@@ -13562,7 +15060,7 @@ cexy_src_changed(char* target_path, char** src_array, usize src_array_len)
         log$error("target_path is NULL\n");
         return false;
     }
-    var target_ftype = os.fs.stat(target_path);
+    auto target_ftype = os.fs.stat(target_path);
     if (!target_ftype.is_valid) {
         if (target_ftype.error == Error.not_found) {
             log$trace("Target '%s' not exists, needs build.\n", target_path);
@@ -13578,7 +15076,7 @@ cexy_src_changed(char* target_path, char** src_array, usize src_array_len)
 
     bool has_error = false;
     for$each (p, src_array, src_array_len) {
-        var ftype = os.fs.stat(p);
+        auto ftype = os.fs.stat(p);
         if (!ftype.is_valid) {
             (void)e$raise(ftype.error, "Error src: %s", p);
             has_error = true;
@@ -13664,37 +15162,37 @@ cexy__fuzz__create(char* target)
     {
         sbuf_c buf = sbuf.create(1024 * 10, _);
         cg$init(&buf);
-        $pn("#define CEX_IMPLEMENTATION");
-        $pn("#include \"cex.h\"");
+        cg$pn("#define CEX_IMPLEMENTATION");
+        cg$pn("#include \"cex.h\"");
 
-        $pn("");
-        $pn("/*");
-        $func("fuzz$setup(void)", "")
+        cg$pn("");
+        cg$pn("/*");
+        cg$func("fuzz$setup(void)", "")
         {
-            $pn("// This function allows programmatically seed new corpus for fuzzer");
-            $pn("io.printf(\"CORPUS: %s\\n\", fuzz$corpus_dir);");
-            $scope("mem$scope(tmem$, _)", "")
+            cg$pn("// This function allows programmatically seed new corpus for fuzzer");
+            cg$pn("io.printf(\"CORPUS: %s\\n\", fuzz$corpus_dir);");
+            cg$scope("memcg$scope(tmem$, _)", "")
             {
-                $pn("char* fn = str.fmt(_, \"%s/my_case\", fuzz$corpus_dir);");
-                $pn("(void)fn;");
-                $pn("// io.file.save(fn, \"my seed data\");");
+                cg$pn("char* fn = str.fmt(_, \"%s/my_case\", fuzz$corpus_dir);");
+                cg$pn("(void)fn;");
+                cg$pn("// io.file.save(fn, \"my seed data\");");
             }
         }
-        $pn("*/");
+        cg$pn("*/");
 
-        $pn("");
-        $func("int\nfuzz$case(const u8* data, usize size)", "")
+        cg$pn("");
+        cg$func("int\nfuzz$case(const u8* data, usize size)", "")
         {
-            $pn("// TODO: do your stuff based on input data and size");
-            $if("size > 2 && data[0] == 'C' && data[1] == 'E' && data[2] == 'X'", "")
+            cg$pn("// TODO: do your stuff based on input data and size");
+            cg$if("size > 2 && data[0] == 'C' && data[1] == 'E' && data[2] == 'X'", "")
             {
-                $pn("__builtin_trap();");
+                cg$pn("__builtin_trap();");
             }
-            $pn("return 0;");
+            cg$pn("return 0;");
         }
 
-        $pn("");
-        $pn("fuzz$main();");
+        cg$pn("");
+        cg$pn("fuzz$main();");
 
         e$ret(io.file.save(target, buf));
     }
@@ -13720,29 +15218,29 @@ cexy__test__create(char* target, bool include_sample)
     {
         sbuf_c buf = sbuf.create(1024 * 10, _);
         cg$init(&buf);
-        $pn("#define CEX_IMPLEMENTATION");
-        $pn("#define CEX_TEST");
-        $pn("#include \"cex.h\"");
-        if (include_sample) { $pn("#include \"lib/mylib.c\""); }
-        $pn("");
-        $pn("//test$setup_case() {return EOK;}");
-        $pn("//test$teardown_case() {return EOK;}");
-        $pn("//test$setup_suite() {return EOK;}");
-        $pn("//test$teardown_suite() {return EOK;}");
-        $pn("");
-        $scope("test$case(%s)", (include_sample) ? "mylib_test_case" : "my_test_case")
+        cg$pn("#define CEX_IMPLEMENTATION");
+        cg$pn("#define CEX_TEST");
+        cg$pn("#include \"cex.h\"");
+        if (include_sample) { cg$pn("#include \"lib/mylib.c\""); }
+        cg$pn("");
+        cg$pn("//test$setup_case() {return EOK;}");
+        cg$pn("//test$teardown_case() {return EOK;}");
+        cg$pn("//test$setup_suite() {return EOK;}");
+        cg$pn("//test$teardown_suite() {return EOK;}");
+        cg$pn("");
+        cg$scope("test$case(%s)", (include_sample) ? "mylib_test_case" : "my_test_case")
         {
             if (include_sample) {
-                $pn("tassert_eq(mylib_add(1, 2), 3);");
-                $pn("// Next will be available after calling `cex process lib/mylib.c`");
-                $pn("// tassert_eq(mylib.add(1, 2), 3);");
+                cg$pn("tassert_eq(mylib_add(1, 2), 3);");
+                cg$pn("// Next will be available after calling `cex process lib/mylib.c`");
+                cg$pn("// tassert_eq(mylib.add(1, 2), 3);");
             } else {
-                $pn("tassert_eq(1, 0);");
+                cg$pn("tassert_eq(1, 0);");
             }
-            $pn("return EOK;");
+            cg$pn("return EOK;");
         }
-        $pn("");
-        $pn("test$main();");
+        cg$pn("");
+        cg$pn("test$main();");
 
         e$ret(io.file.save(target, buf));
     }
@@ -13893,11 +15391,11 @@ _cexy__process_gen_struct(str_s ns_prefix, arr$(cex_decl_s*) decls, sbuf_c* out_
     cg$init(out_buf);
     str_s subn = { 0 };
 
-    $scope("struct __cex_namespace__%S ", ns_prefix)
+    cg$scope("struct __cex_namespace__%S ", ns_prefix)
     {
-        $pn("// Autogenerated by CEX");
-        $pn("// clang-format off");
-        $pn("");
+        cg$pn("// Autogenerated by CEX");
+        cg$pn("// clang-format off");
+        cg$pn("");
         for$each (it, decls) {
             str_s clean_name = it->name;
             if (str.slice.starts_with(clean_name, str$s("cex_"))) {
@@ -13914,31 +15412,46 @@ _cexy__process_gen_struct(str_s ns_prefix, arr$(cex_decl_s*) decls, sbuf_c* out_
                     if (subn.buf != NULL) {
                         // End previous sub-namespace
                         cg$dedent();
-                        $pf("} %S;", subn);
+                        cg$pf("} %S;", subn);
                     }
 
                     // new subnamespace begin
-                    $pn("");
-                    $pf("struct {", subn);
+                    cg$pn("");
+                    cg$pf("struct {", subn);
                     cg$indent();
                     subn = new_ns;
                 }
                 clean_name = str.slice.sub(clean_name, 1 + subn.len + 2, 0);
             }
             str_s brief_str = _cexy__process_make_brief_docs(it);
-            if (brief_str.len) { $pf("/// %S", brief_str); }
-            $pf("%-15s (*%S)(%s);", it->ret_type, clean_name, it->args);
+            if (brief_str.len) { 
+                // Handling comments + special multi-line treatment
+                for$iter(str_s, it, str.slice.iter_split(brief_str, "\n", &it.iterator)) {
+                    str_s _line = str.slice.strip(it.val);
+                    if (str.slice.starts_with(_line, str$s("///"))) {
+                        _line = str.slice.sub(_line, 3, 0);
+                    }
+                    if (str.slice.starts_with(_line, str$s("* "))) {
+                        _line = str.slice.sub(_line, 2, 0);
+                    }
+                    _line = str.slice.strip(_line);
+                    if (_line.len) {
+                        cg$pf("/// %S", _line); 
+                    }
+                }
+            }
+            cg$pf("%-15s (*%S)(%s);", it->ret_type, clean_name, it->args);
         }
 
         if (subn.buf != NULL) {
             // End previous sub-namespace
             cg$dedent();
-            $pf("} %S;", subn);
+            cg$pf("} %S;", subn);
         }
-        $pn("");
-        $pn("// clang-format on");
+        cg$pn("");
+        cg$pn("// clang-format on");
     }
-    $pa("%s", ";");
+    cg$pa("%s", ";");
 
     if (!cg$is_valid()) { return e$raise(Error.runtime, "Code generation error occured\n"); }
     return EOK;
@@ -13950,11 +15463,11 @@ _cexy__process_gen_var_def(str_s ns_prefix, arr$(cex_decl_s*) decls, sbuf_c* out
     cg$init(out_buf);
     str_s subn = { 0 };
 
-    $scope("const struct __cex_namespace__%S %S = ", ns_prefix, ns_prefix)
+    cg$scope("const struct __cex_namespace__%S %S = ", ns_prefix, ns_prefix)
     {
-        $pn("// Autogenerated by CEX");
-        $pn("// clang-format off");
-        $pn("");
+        cg$pn("// Autogenerated by CEX");
+        cg$pn("// clang-format off");
+        cg$pn("");
         for$each (it, decls) {
             str_s clean_name = it->name;
             if (str.slice.starts_with(clean_name, str$s("cex_"))) {
@@ -13971,29 +15484,29 @@ _cexy__process_gen_var_def(str_s ns_prefix, arr$(cex_decl_s*) decls, sbuf_c* out
                     if (subn.buf != NULL) {
                         // End previous sub-namespace
                         cg$dedent();
-                        $pn("},");
+                        cg$pn("},");
                     }
 
                     // new subnamespace begin
-                    $pn("");
-                    $pf(".%S = {", new_ns);
+                    cg$pn("");
+                    cg$pf(".%S = {", new_ns);
                     cg$indent();
                     subn = new_ns;
                 }
                 clean_name = str.slice.sub(clean_name, 1 + subn.len + 2, 0);
             }
-            $pf(".%S = %S,", clean_name, it->name);
+            cg$pf(".%S = %S,", clean_name, it->name);
         }
 
         if (subn.buf != NULL) {
             // End previous sub-namespace
             cg$dedent();
-            $pf("},", subn);
+            cg$pf("},", subn);
         }
-        $pn("");
-        $pn("// clang-format on");
+        cg$pn("");
+        cg$pn("// clang-format on");
     }
-    $pa("%s", ";");
+    cg$pa("%s", ";");
 
     if (!cg$is_valid()) { return e$raise(Error.runtime, "Code generation error occured\n"); }
     return EOK;
@@ -14102,12 +15615,13 @@ _cexy__fn_match(str_s fn_name, str_s ns_prefix)
         char* fn_private = str.fmt(_, "%S__*", ns_prefix);
         char* fn_private_cex = str.fmt(_, "cex_%S__*", ns_prefix);
 
-        if (str.slice.starts_with(fn_name, str$s("_"))) { continue; }
+        if (str.slice.starts_with(fn_name, str$s("_"))) { return false; }
+
         if (str.slice.match(fn_name, fn_sub_pattern) ||
             str.slice.match(fn_name, fn_sub_pattern_cex)) {
             return true;
-        } else if ((str.slice.match(fn_name, fn_private) || str.slice.match(fn_name, fn_private_cex)
-                   ) ||
+        } else if ((str.slice.match(fn_name, fn_private) ||
+                    str.slice.match(fn_name, fn_private_cex)) ||
                    (!str.slice.match(fn_name, fn_pattern_cex) &&
                     !str.slice.match(fn_name, fn_pattern))) {
             return false;
@@ -14393,7 +15907,7 @@ cexy__cmd__stats(int argc, char** argv, void* user_ctx)
             if (hm$getp(excl_files, src_fn.key)) { continue; }
 
             char* basename = os.path.basename(src_fn.key, _);
-            if (str.eq(basename, "cex.h") && str.eq(target, "*.[ch]")) { continue; }
+            if (str.eq(basename, "cex.h")) { continue; }
             struct code_stats* stats = (str.find(basename, "test") != NULL) ? &test_stats
                                                                             : &code_stats;
 
@@ -14614,10 +16128,10 @@ _cexy__colorize_ansi(str_s token, str_s exact_match, char current_char)
     return "\033[0m"; // no color, not matched
 }
 static void
-_cexy__colorize_print(str_s code, str_s name)
+_cexy__colorize_print(str_s code, str_s name, FILE* output)
 {
-    if (code.buf == NULL || !io.isatty(stdout)) {
-        io.printf("%S", code);
+    if (code.buf == NULL || !io.isatty(output)) {
+        io.fprintf(output, "%S", code);
         return;
     }
 
@@ -14633,7 +16147,7 @@ _cexy__colorize_print(str_s code, str_s name)
                 token.buf = &code.buf[i];
                 token.len = 1;
             } else {
-                putc(c, stdout);
+                putc(c, output);
             }
         } else {
             switch (c) {
@@ -14661,8 +16175,8 @@ _cexy__colorize_print(str_s code, str_s name)
                     } else if (c == ')' && i > 2 && token.buf[-1] == '*' && token.buf[-2] == '(') {
                         _c = '(';
                     }
-                    io.printf("%s%S\033[0m", _cexy__colorize_ansi(token, name, _c), token);
-                    putc(c, stdout);
+                    io.fprintf(output, "%s%S\033[0m", _cexy__colorize_ansi(token, name, _c), token);
+                    putc(c, output);
                     in_token = false;
                     break;
                 }
@@ -14672,7 +16186,9 @@ _cexy__colorize_print(str_s code, str_s name)
         }
     }
 
-    if (in_token) { io.printf("%s%S\033[0m", _cexy__colorize_ansi(token, name, 0), token); }
+    if (in_token) {
+        io.fprintf(output, "%s%S\033[0m", _cexy__colorize_ansi(token, name, 0), token);
+    }
     return;
 }
 
@@ -14682,13 +16198,21 @@ _cexy__display_full_info(
     char* base_ns,
     bool show_source,
     bool show_example,
-    arr$(cex_decl_s*) cex_ns_decls
+    arr$(cex_decl_s*) cex_ns_decls,
+    FILE* output
 )
 {
+    uassert(output);
+
     str_s name = d->name;
+    str_s base_name = str.sstr(base_ns);
+
     mem$scope(tmem$, _)
     {
-        io.printf("Symbol found at %s:%d\n", d->file, d->line + 1);
+        if (!cex_ns_decls) {
+            io.fprintf(output, "Symbol found at %s:%d\n\n", d->file, d->line + 1);
+        }
+
         if (d->type == CexTkn__func_def) {
             name = _cexy__fn_dotted(d->name, base_ns, _);
             if (!name.buf) {
@@ -14697,80 +16221,130 @@ _cexy__display_full_info(
             }
         }
         if (d->docs.buf) {
-            _cexy__colorize_print(d->docs, name);
-            io.printf("\n");
+            // strip doxygen tags
+            if (str.slice.starts_with(d->docs, str$s("/**"))) {
+                d->docs = str.slice.sub(d->docs, 3, 0);
+            }
+            if (str.slice.ends_with(d->docs, str$s("*/"))) {
+                d->docs = str.slice.sub(d->docs, 0, -2);
+            }
+            _cexy__colorize_print(d->docs, name, output);
+            io.fprintf(output, "\n");
         }
+
+        if (output != stdout) {
+            // For export using c code block (markdown compatible)
+            io.fprintf(output, "\n```c\n");
+        }
+
+        cex_decl_s* ns_struct = NULL;
+
         if (cex_ns_decls) {
             // This only passed if we have cex namespace struct here
-            bool has_macro = false;
             mem$scope(tmem$, _)
             {
-                hm$(str_s, cex_decl_s*) macros = hm$new(macros, _, .capacity = 64);
+
+                hm$(str_s, cex_decl_s*) ns_symbols = hm$new(ns_symbols, _, .capacity = 128);
                 for$each (it, cex_ns_decls) {
-                    if (!(it->type == CexTkn__macro_func || it->type == CexTkn__macro_const)) {
+                    // Check if __namespace$ exists
+                    if (it->type == CexTkn__macro_const &&
+                        str.slice.starts_with(it->name, str$s("__"))) {
+                        if (str.slice.eq(str.slice.sub(it->name, 2, -1), base_name)) {
+                            ns_struct = it;
+                        }
+                    }
+                    if (!str.slice.starts_with(it->name, base_name)) { continue; }
+
+                    if ((it->type == CexTkn__macro_func || it->type == CexTkn__macro_const)) {
+                        if (it->name.buf[base_name.len] != '$') { continue; }
+                    } else if (it->type == CexTkn__typedef) {
+                        if (it->name.buf[base_name.len] != '_') { continue; }
+                        if (!(str.slice.ends_with(it->name, str$s("_c")) ||
+                              str.slice.ends_with(it->name, str$s("_s")))) {
+                            continue;
+                        }
+                    } else if (it->type == CexTkn__cex_module_struct) {
+                        ns_struct = it;
+                        continue; // does not add, use special treatment
+                    } else {
                         continue;
                     }
-                    if (str.slice.starts_with(it->name, name) && it->name.buf[name.len] == '$') {
-                        if (!has_macro) {
-                            io.printf("\n");
-                            has_macro = true;
-                        }
-                        if (hm$getp(macros, it->name) != NULL) {
-                            if (it->docs.buf) { hm$set(macros, it->name, it); }
-                            continue; // duplicate
-                        }
-                        hm$set(macros, it->name, it);
+
+                    if (hm$getp(ns_symbols, it->name) != NULL) {
+                        // Maybe new with docs?
+                        if (it->docs.buf) { hm$set(ns_symbols, it->name, it); }
+                        continue; // duplicate
+                    } else {
+                        hm$set(ns_symbols, it->name, it);
                     }
                 }
                 // WARNING: sorting of hashmap items is a dead end, hash indexes get invalidated
-                qsort(macros, hm$len(macros), sizeof(*macros), str.slice.qscmp);
+                qsort(ns_symbols, hm$len(ns_symbols), sizeof(*ns_symbols), str.slice.qscmp);
 
-                for$each (it, macros) {
+                for$each (it, ns_symbols) {
                     if (it.value->docs.buf) {
                         str_s brief_str = _cexy__process_make_brief_docs(it.value);
-                        if (brief_str.len) { io.printf("/// %S\n", brief_str); }
+                        if (brief_str.len) { io.fprintf(output, "/// %S\n", brief_str); }
                     }
                     char* l = NULL;
                     if (it.value->type == CexTkn__macro_func) {
                         l = str.fmt(_, "#define %S(%s)\n", it.value->name, it.value->args);
-                    } else {
+                    } else if (it.value->type == CexTkn__macro_const) {
                         l = str.fmt(_, "#define %S\n", it.value->name);
+                    } else if (it.value->type == CexTkn__typedef) {
+                        l = str.fmt(_, "%s %S\n", it.value->ret_type, it.value->name);
                     }
-                    _cexy__colorize_print(str.sstr(l), name);
+                    if (l) {
+                        _cexy__colorize_print(str.sstr(l), name, output);
+                        io.fprintf(output, "\n");
+                    }
                 }
             }
-            io.printf("\n\n");
+            io.fprintf(output, "\n\n");
         }
 
         if (d->type == CexTkn__macro_const || d->type == CexTkn__macro_func) {
-            io.printf("#define ");
+            if (str.slice.starts_with(d->name, str$s("__"))) {
+                if (output != stdout) { io.fprintf(output, "\n```\n"); }
+                goto end; // NOTE: it's likely placeholder i.e. __foo$ - only for docs, just skip
+            }
+            io.fprintf(output, "#define ");
         }
 
         if (sbuf.len(&d->ret_type)) {
-            _cexy__colorize_print(str.sstr(d->ret_type), name);
-            io.printf(" ");
+            _cexy__colorize_print(str.sstr(d->ret_type), name, output);
+            io.fprintf(output, " ");
         }
 
-        _cexy__colorize_print(name, name);
-        io.printf(" ");
+        _cexy__colorize_print(name, name, output);
+        io.fprintf(output, " ");
 
         if (sbuf.len(&d->args)) {
-            io.printf("(");
-            _cexy__colorize_print(str.sstr(d->args), name);
-            io.printf(")");
+            io.fprintf(output, "(");
+            _cexy__colorize_print(str.sstr(d->args), name, output);
+            io.fprintf(output, ")");
         }
         if (!show_source && d->type == CexTkn__func_def) {
-            io.printf(";");
+            io.fprintf(output, ";");
         } else if (d->body.buf) {
-            _cexy__colorize_print(d->body, name);
-            io.printf(";");
+            _cexy__colorize_print(d->body, name, output);
+            io.fprintf(output, ";");
+        } else if (ns_struct) {
+            _cexy__colorize_print(ns_struct->body, name, output);
         }
-        io.printf("\n");
+        io.fprintf(output, "\n");
 
-        if (!show_example) { return EOK; }
+        if (output != stdout) {
+            // For export using c code block (markdown compatible)
+            io.fprintf(output, "\n```\n");
+        }
+
+        // No examples for whole namespaces (early exit)
+        if (!show_example || ns_struct) { goto end; }
+
         // Looking for a random example
         srand(time(NULL));
-        io.printf("\nSearching for examples of '%S'\n", name);
+        io.fprintf(output, "\nSearching for examples of '%S'\n", name);
         arr$(char*) sources = os.fs.find("./*.[hc]", true, _);
 
         u32 n_used = 0;
@@ -14795,25 +16369,37 @@ _cexy__display_full_info(
                         n_used++;
                         double dice = (double)rand() / (RAND_MAX + 1.0);
                         if (dice < 0.25) {
-                            io.printf("\n\nFound at %s:%d\n", src_fn, d->line);
-                            io.printf("%s %S(%s)\n", d->ret_type, d->name, d->args);
-                            _cexy__colorize_print(d->body, name);
-                            io.printf("\n");
-                            return EOK;
+                            io.fprintf(output, "\n\nFound at %s:%d\n", src_fn, d->line);
+
+                            if (output != stdout) { io.fprintf(output, "\n```c\n"); }
+
+                            io.fprintf(output, "%s %S(%s)\n", d->ret_type, d->name, d->args);
+                            _cexy__colorize_print(d->body, name, output);
+                            io.fprintf(output, "\n");
+
+                            if (output != stdout) { io.fprintf(output, "\n```\n"); }
+
+                            goto end;
                         }
                     }
                 }
             }
         }
         if (n_used == 0) {
-            io.printf("No usages of %S in the codebase\n", name);
+            io.fprintf(output, "No usages of %S in the codebase\n", name);
         } else {
-            io.printf(
+            io.fprintf(
+                output,
                 "%d usages of %S in the codebase, but no random pick, try again!\n",
                 n_used,
                 name
             );
         }
+    }
+end:
+    if (output != stdout) {
+        if (io.fflush(output)) {};
+        io.fclose(&output);
     }
     return EOK;
 }
@@ -14830,9 +16416,9 @@ cexy__cmd__help(int argc, char** argv, void* user_ctx)
         "cex help                     - list all namespaces in project directory\n"
         "cex help foo                 - find any symbol containing 'foo' (case sensitive)\n"
         "cex help foo.                - find namespace prefix: foo$, Foo_func(), FOO_CONST, etc\n"
+        "cex help os$                 - find CEX namespace help (docs, macros, functions, types)\n"
         "cex help 'foo_*_bar'         - find using pattern search for symbols (see 'cex help str.match')\n"
         "cex help '*_(bar|foo)'       - find any symbol ending with '_bar' or '_foo'\n"
-        "cex help os                  - display all functions of 'os' namespace (for CEX or user project)\n"
         "cex help str.find            - display function documentation if exactly matched\n"
         "cex help 'os$PATH_SEP'       - display macro constant value if exactly matched\n"
         "cex help str_s               - display type info and documentation if exactly matched\n"
@@ -14840,6 +16426,7 @@ cexy__cmd__help(int argc, char** argv, void* user_ctx)
         "cex help --example str.find  - display random function use in codebase if exactly matched\n"
     ;
     char* filter = "./*.[hc]";
+    char* out_file = NULL;
     bool show_source = false;
     bool show_example = false;
 
@@ -14860,22 +16447,30 @@ cexy__cmd__help(int argc, char** argv, void* user_ctx)
                 "example",
                 .help = "finds random example in source base"
             ),
+            argparse$opt(&out_file, 'o', "out", .help = "write output of command to file"),
         ),
     };
     if (argparse.parse(&cmd_args, argc, argv)) { return Error.argsparse; }
     char* query = argparse.next(&cmd_args);
     str_s query_s = str.sstr(query);
 
+    FILE* output = NULL;
+    if (out_file) {
+        e$ret(io.fopen(&output, out_file, "w"));
+    } else {
+        output = stdout;
+    }
+
     mem$arena(1024 * 100, arena)
     {
 
-        arr$(char*) sources = os.fs.find("./*.[hc]", true, arena);
+        arr$(char*) sources = os.fs.find(filter, true, arena);
         if (os.fs.stat("./cex.h").is_symlink) { arr$push(sources, "./cex.h"); }
         arr$sort(sources, str.qscmp);
 
         char* query_pattern = NULL;
         bool is_namespace_filter = false;
-        if (str.match(query, "[a-zA-Z0-9+].")) {
+        if (str.match(query, "[a-zA-Z0-9+].") || str.match(query, "[a-zA-Z0-9+]$")) {
             query_pattern = str.fmt(arena, "%S[._$]*", str.sub(query, 0, -1));
             is_namespace_filter = true;
         } else if (_cexy__is_str_pattern(query)) {
@@ -14898,7 +16493,7 @@ cexy__cmd__help(int argc, char** argv, void* user_ctx)
                     continue;
                 }
 
-                var basename = os.path.basename(src_fn, _);
+                auto basename = os.path.basename(src_fn, _);
                 if (str.starts_with(basename, "_") || str.starts_with(basename, "test_")) {
                     continue;
                 }
@@ -14911,6 +16506,7 @@ cexy__cmd__help(int argc, char** argv, void* user_ctx)
                 }
                 arr$(cex_token_s) items = arr$new(items, _);
                 arr$(cex_decl_s*) all_decls = arr$new(all_decls, _);
+                cex_decl_s* ns_decl = NULL;
 
                 CexParser_c lx = CexParser.create(code, 0, true);
                 cex_token_s t;
@@ -14954,13 +16550,15 @@ cexy__cmd__help(int argc, char** argv, void* user_ctx)
                         if (str.slice.eq(d->name, query_s) || str.slice.eq(fndotted, query_s)) {
                             if (d->type == CexTkn__cex_module_def) { continue; }
                             if (d->type == CexTkn__typedef && d->ret_type[0] == '\0') { continue; }
+                            if (is_namespace_filter) { continue; }
                             // We have full match display full help
                             return _cexy__display_full_info(
                                 d,
                                 base_ns,
                                 show_source,
                                 show_example,
-                                (d->type == CexTkn__cex_module_struct) ? all_decls : NULL
+                                NULL,
+                                output
                             );
                         }
 
@@ -14970,17 +16568,67 @@ cexy__cmd__help(int argc, char** argv, void* user_ctx)
                         if (is_namespace_filter) {
                             str_s prefix = str.sub(query, 0, -1);
                             str_s sub_name = str.slice.sub(d->name, 0, prefix.len);
-                            if (str.slice.eqi(sub_name, prefix) &&
-                                sub_name.buf[prefix.len] == '_') {
-                                if (d->type == CexTkn__func_def && str.eqi(query, "cex.")) {
-                                    // skipping other namespaces of cex, e.g. cex_str_len()
-                                    continue;
+                            if (prefix.buf[prefix.len] == '.') {
+                                // query case: ./cex help foo.
+                                if (str.slice.eqi(sub_name, prefix) &&
+                                    sub_name.buf[prefix.len] == '_') {
+                                    if (d->type == CexTkn__func_def && str.eqi(query, "cex.")) {
+                                        // skipping other namespaces of cex, e.g. cex_str_len()
+                                        continue;
+                                    }
+                                    has_match = true;
                                 }
-                                has_match = true;
+                            } else {
+                                // query case: ./cex help foo$
+                                if (d->type == CexTkn__macro_const &&
+                                    str.slice.starts_with(d->name, str$s("__"))) {
+                                    // include __foo$ (doc name)
+                                    sub_name = str.slice.sub(d->name, 2, -1);
+                                    if (str.slice.eq(sub_name, prefix)) {
+                                        ns_decl = d;
+                                        has_match = true;
+                                    }
+                                }
+                                if (str.slice.eq(sub_name, prefix)) {
+                                    if (d->type == CexTkn__cex_module_struct &&
+                                        str.slice.eq(d->name, prefix)) {
+                                        // full match of CEX namespace, query: os$, d->name = 'os'
+                                        ns_decl = d;
+                                        has_match = true;
+                                    } else {
+                                        switch (sub_name.buf[prefix.len]) {
+                                            case '_':
+                                                if (d->type != CexTkn__typedef) { continue; }
+                                                if (!(str.slice.ends_with(d->name, str$s("_c")) ||
+                                                      str.slice.ends_with(d->name, str$s("_s")))) {
+                                                    continue;
+                                                }
+                                                fallthrough();
+                                            case '$':
+                                                if (!ns_decl) { ns_decl = d; }
+                                                has_match = true;
+                                                break;
+                                            default:
+                                                continue;
+                                        }
+                                    }
+                                }
                             }
                         }
                         if (has_match) { hm$set(names, d->name, d); }
                     }
+                }
+
+                if (ns_decl) {
+                    char* ns_prefix = str.slice.clone(str.sub(query, 0, -1), _);
+                    return _cexy__display_full_info(
+                        ns_decl,
+                        ns_prefix,
+                        false,
+                        false,
+                        all_decls,
+                        output
+                    );
                 }
                 if (arr$len(names) == 0) { continue; }
             }
@@ -14993,16 +16641,16 @@ cexy__cmd__help(int argc, char** argv, void* user_ctx)
             if (query == NULL) {
                 switch (it.value->type) {
                     case CexTkn__cex_module_struct:
-                        io.printf("%-20s", "cexy namespace");
+                        io.fprintf(output, "%-20s", "cexy namespace");
                         break;
                     case CexTkn__macro_func:
                     case CexTkn__macro_const:
-                        io.printf("%-20s", "macro namespace");
+                        io.fprintf(output, "%-20s", "macro namespace");
                         break;
                     default:
-                        io.printf("%-20s", CexTkn_str[it.value->type]);
+                        io.fprintf(output, "%-20s", CexTkn_str[it.value->type]);
                 }
-                io.printf(" %-30S %s:%d\n", it.key, it.value->file, it.value->line + 1);
+                io.fprintf(output, " %-30S %s:%d\n", it.key, it.value->file, it.value->line + 1);
             } else {
                 str_s name = it.key;
                 char* cex_ns = hm$get(cex_ns_map, (char*)it.value->file);
@@ -15019,7 +16667,8 @@ cexy__cmd__help(int argc, char** argv, void* user_ctx)
                     }
                 }
 
-                io.printf(
+                io.fprintf(
+                    output,
                     "%-20s %-30S %s:%d\n",
                     CexTkn_str[it.value->type],
                     name,
@@ -15029,6 +16678,8 @@ cexy__cmd__help(int argc, char** argv, void* user_ctx)
             }
         }
     }
+
+    if (output && output != stdout) { io.fclose(&output); }
 
     return EOK;
 }
@@ -15351,10 +17002,10 @@ cexy__utils__make_new_project(char* proj_dir)
         }
 
         log$info("Making '%s/cex.c'\n", proj_dir);
-        var cex_c = os$path_join(_, proj_dir, "cex.c");
-        var lib_h = os$path_join(_, proj_dir, "lib", "mylib.h");
-        var lib_c = os$path_join(_, proj_dir, "lib", "mylib.c");
-        var app_c = os$path_join(_, proj_dir, "src", "myapp.c");
+        auto cex_c = os$path_join(_, proj_dir, "cex.c");
+        auto lib_h = os$path_join(_, proj_dir, "lib", "mylib.h");
+        auto lib_c = os$path_join(_, proj_dir, "lib", "mylib.c");
+        auto app_c = os$path_join(_, proj_dir, "src", "myapp.c");
         e$assert(!os.path.exists(cex_c) && "cex.c already exists");
         e$assert(!os.path.exists(lib_h) && "mylib.h already exists");
         e$assert(!os.path.exists(lib_h) && "mylib.c already exists");
@@ -15381,10 +17032,10 @@ cexy__utils__make_new_project(char* proj_dir)
             e$ret(os.fs.mkpath(lib_h));
             sbuf.clear(&buf);
             cg$init(&buf);
-            $pn("#pragma once");
-            $pn("#include \"cex.h\"");
-            $pn("");
-            $pn("i32 mylib_add(i32 a, i32 b);");
+            cg$pn("#pragma once");
+            cg$pn("#include \"cex.h\"");
+            cg$pn("");
+            cg$pn("i32 mylib_add(i32 a, i32 b);");
             e$ret(io.file.save(lib_h, buf));
         }
 
@@ -15393,12 +17044,12 @@ cexy__utils__make_new_project(char* proj_dir)
             e$ret(os.fs.mkpath(lib_c));
             sbuf.clear(&buf);
             cg$init(&buf);
-            $pn("#include \"mylib.h\"");
-            $pn("#include \"cex.h\"");
-            $pn("");
-            $func("i32 mylib_add(i32 a, i32 b)", "")
+            cg$pn("#include \"mylib.h\"");
+            cg$pn("#include \"cex.h\"");
+            cg$pn("");
+            cg$func("i32 mylib_add(i32 a, i32 b)", "")
             {
-                $pn("return a + b;");
+                cg$pn("return a + b;");
             }
             e$ret(io.file.save(lib_c, buf));
         }
@@ -15408,26 +17059,26 @@ cexy__utils__make_new_project(char* proj_dir)
             e$ret(os.fs.mkpath(app_c));
             sbuf.clear(&buf);
             cg$init(&buf);
-            $pn("#define CEX_IMPLEMENTATION");
-            $pn("#include \"cex.h\"");
-            $pn("#include \"lib/mylib.c\"  /* NOTE: include .c to make unity build! */");
-            $pn("");
-            $func("int main(int argc, char** argv)", "")
+            cg$pn("#define CEX_IMPLEMENTATION");
+            cg$pn("#include \"cex.h\"");
+            cg$pn("#include \"lib/mylib.c\"  /* NOTE: include .c to make unity build! */");
+            cg$pn("");
+            cg$func("int main(int argc, char** argv)", "")
             {
-                $pn("(void)argc;");
-                $pn("(void)argv;");
-                $pn("io.printf(\"MOCCA - Make Old C Cexy Again!\\n\");");
-                $pn("io.printf(\"1 + 2 = %d\\n\", mylib_add(1, 2));");
-                $pn("return 0;");
+                cg$pn("(void)argc;");
+                cg$pn("(void)argv;");
+                cg$pn("io.printf(\"MOCCA - Make Old C Cexy Again!\\n\");");
+                cg$pn("io.printf(\"1 + 2 = %d\\n\", mylib_add(1, 2));");
+                cg$pn("return 0;");
             }
             e$ret(io.file.save(app_c, buf));
         }
 
-        var test_c = os$path_join(_, proj_dir, "tests", "test_mylib.c");
+        auto test_c = os$path_join(_, proj_dir, "tests", "test_mylib.c");
         log$info("Making '%s'\n", test_c);
         e$ret(cexy.test.create(test_c, true));
         log$info("Compiling new cex app for a new project...\n");
-        var old_dir = os.fs.getcwd(_);
+        auto old_dir = os.fs.getcwd(_);
 
         e$ret(os.fs.chdir(proj_dir));
         char* bin_path = "cex" cexy$build_ext_exe;
@@ -15487,25 +17138,25 @@ cexy__app__create(char* target)
         sbuf_c buf = sbuf.create(1024 * 10, _);
         cg$init(&buf);
         // clang-format off
-        $pn("#include \"cex.h\"");
-        $pn("");
-        $func("Exception\n%s(int argc, char** argv)\n", target)
+        cg$pn("#include \"cex.h\"");
+        cg$pn("");
+        cg$func("Exception\n%s(int argc, char** argv)\n", target)
         {
-            $pn("bool my_flag = false;");
-            $scope("argparse_c args = ", target)
+            cg$pn("bool my_flag = false;");
+            cg$scope("argparse_c args = ", target)
             {
-                $pn(".description = \"New CEX App\",");
-                $pn("argparse$opt_list(");
-                $pn("    argparse$opt_help(),");
-                $pn("    argparse$opt(&my_flag, 'c', \"ctf\", .help = \"Capture the flag\"),");
-                $pn("),");
+                cg$pn(".description = \"New CEX App\",");
+                cg$pn("argparse$opt_list(");
+                cg$pn("    argparse$opt_help(),");
+                cg$pn("    argparse$opt(&my_flag, 'c', \"ctf\", .help = \"Capture the flag\"),");
+                cg$pn("),");
             }
-            $pa(";\n", "");
-            $pn("if (argparse.parse(&args, argc, argv)) { return Error.argsparse; }");
-            $pn("io.printf(\"MOCCA - Make Old C Cexy Again!\\n\");");
-            $pn("io.printf(\"%s\\n\", (my_flag) ? \"Flag is captured\" : \"Pass --ctf to capture the flag\");");
+            cg$pa(";\n", "");
+            cg$pn("if (argparse.parse(&args, argc, argv)) { return Error.argsparse; }");
+            cg$pn("io.printf(\"MOCCA - Make Old C Cexy Again!\\n\");");
+            cg$pn("io.printf(\"%s\\n\", (my_flag) ? \"Flag is captured\" : \"Pass --ctf to capture the flag\");");
 
-            $pn("return EOK;");
+            cg$pn("return EOK;");
         };
         // clang-format on
         e$ret(io.file.save(app_src, buf));
@@ -15522,16 +17173,16 @@ cexy__app__create(char* target)
         sbuf_c buf = sbuf.create(1024 * 10, _);
         cg$init(&buf);
         // clang-format off
-        $pn("// NOTE: main.c serves as unity build container + detaching allows unit testing of app's code");
-        $pn("#define CEX_IMPLEMENTATION");
-        $pn("#include \"cex.h\"");
-        $pf("#include \"%s.c\"", target);
-        $pn("// TODO: add your app sources here (include .c)");
-        $pn("");
-        $func("int\nmain(int argc, char** argv)\n", "")
+        cg$pn("// NOTE: main.c serves as unity build container + detaching allows unit testing of app's code");
+        cg$pn("#define CEX_IMPLEMENTATION");
+        cg$pn("#include \"cex.h\"");
+        cg$pf("#include \"%s.c\"", target);
+        cg$pn("// TODO: add your app sources here (include .c)");
+        cg$pn("");
+        cg$func("int\nmain(int argc, char** argv)\n", "")
         {
-            $pf("if (%s(argc, argv) != EOK) { return 1; }", target);
-            $pn("return 0;");
+            cg$pf("if (%s(argc, argv) != EOK) { return 1; }", target);
+            cg$pn("return 0;");
         }
         // clang-format on
         e$ret(io.file.save(app_src, buf));
@@ -16078,7 +17729,8 @@ cexy__utils__pkgconf(
         io.printf("\n");
 
 #    endif
-        e$ret(os.cmd.create(&c, args, arr$len(args), &(os_cmd_flags_s){ .combine_stdouterr = true })
+        e$ret(
+            os.cmd.create(&c, args, arr$len(args), &(os_cmd_flags_s){ .combine_stdouterr = true })
         );
 
         char* output = os.cmd.read_all(&c, _);
@@ -16202,12 +17854,12 @@ cexy__utils__git_lib_fetch(
             char* out_path = (preserve_dirs)
                                ? str.fmt(_, "%s/%s", out_dir, it)
                                : str.fmt(_, "%s/%s", out_dir, os.path.basename(it, _));
-            var in_stat = os.fs.stat(in_path);
+            auto in_stat = os.fs.stat(in_path);
             if (!in_stat.is_valid) {
                 return e$raise(in_stat.error, "Invalid stat for path: %s", in_path);
             }
 
-            var out_stat = os.fs.stat(out_path);
+            auto out_stat = os.fs.stat(out_path);
             if (!out_stat.is_valid || update_existing) {
                 log$info("Updating file: %s -> %s\n", it, out_path);
                 if (in_stat.is_directory) {
@@ -16586,13 +18238,13 @@ _CexParser__scan_scope(CexParser_c* lx)
                     break;
                 case '"':
                 case '\'': {
-                    var s = _CexParser__scan_string(lx);
+                    auto s = _CexParser__scan_string(lx);
                     t.value.len += s.value.len + 2;
                     continue;
                 }
                 case '/': {
                     if (lx$peek_next(lx) == '/' || lx$peek_next(lx) == '*') {
-                        var s = _CexParser__scan_comment(lx);
+                        auto s = _CexParser__scan_comment(lx);
                         t.value.len += s.value.len;
                         continue;
                     }
@@ -16600,7 +18252,7 @@ _CexParser__scan_scope(CexParser_c* lx)
                 }
                 case '#': {
                     char* ppstart = lx->cur;
-                    var s = _CexParser__scan_preproc(lx);
+                    auto s = _CexParser__scan_preproc(lx);
                     if (s.value.buf) {
                         t.value.len += s.value.len + (s.value.buf - ppstart) + 1;
                     } else {
@@ -16756,8 +18408,6 @@ CexParser_next_entity(CexParser_c* lx, arr$(cex_token_s) * children)
             uassert(result.value.len < 1024 * 1024 && "token diff it too high, bad pointers?");
         }
         arr$push(*children, t);
-        
-        
         switch (t.type) {
             case CexTkn__preproc: {
                 if (str.slice.starts_with(t.value, str$s("define "))) {
@@ -16811,7 +18461,7 @@ CexParser_next_entity(CexParser_c* lx, arr$(cex_token_s) * children)
             case CexTkn__ident: {
                 if (str.slice.match(t.value, "(typedef|struct|enum|union)")) {
                     if (result.type != CexTkn__var_decl) { result.type = CexTkn__typedef; }
-                } else if (str.slice.match(t.value, "extern")) {
+                } else if (str.slice.match(t.value, "CEX_NAMESPACE") || str.slice.match(t.value, "extern")) {
                     result.type = CexTkn__var_decl;
                 } else if (str.slice.match(t.value, "__cex_namespace__*")) {
                     has_cex_namespace = true;
@@ -16947,7 +18597,7 @@ CexParser_decl_parse(
                     char* prev_end = _t.value.buf + _t.value.len;
                     _t = CexParser.next_token(&_lx);
                     if (_t.type == CexTkn__paren_block) {
-                        var _args = _t.value.len > 2 ? str.slice.sub(_t.value, 1, -1) : str$s("");
+                        auto _args = _t.value.len > 2 ? str.slice.sub(_t.value, 1, -1) : str$s("");
                         e$goto(sbuf.appendf(&result->args, "%S", _args), fail);
                         prev_end = _t.value.buf + _t.value.len;
                         _t = CexParser.next_token(&_lx);
@@ -17061,8 +18711,7 @@ CexParser_decl_parse(
     //  <<<<<  #define $append_fmt
 
     // Exclude items with starting _ or special functions or other stuff
-    if (str.slice.starts_with(result->name, str$s("_")) ||
-        str.slice.match(result->name, "(_Static_assert|static_assert)")) {
+    if (str.slice.match(result->name, "(_Static_assert|static_assert)")) {
         goto fail;
     }
 
@@ -17205,587 +18854,6 @@ const struct __cex_namespace__CexParser CexParser = {
 
 
 /*
-*                          src/json.c
-*/
-
-#define $next_tok() /* TEMP MACRO */                                                               \
-    ({                                                                                             \
-        cex_token_s _tok = CexParser.next_token(&it->_impl.lexer);                                 \
-        if (!it->_impl.strict_mode) {                                                              \
-            while (_tok.type == CexTkn__comment_single || _tok.type == CexTkn__comment_multi) {    \
-                _tok = CexParser.next_token(&it->_impl.lexer);                                     \
-            }                                                                                      \
-        }                                                                                          \
-        it->_impl.prev_token = it->_impl.curr_token;                                               \
-        it->_impl.curr_token = _tok.type;                                                          \
-        _tok;                                                                                      \
-    })
-
-
-/**
- * @brief Create new JSON reader (it doesn't allocate memory and uses content slicing)
- *
- * @param it self instance (typically allocated on stack)
- * @param content  JSON content
- * @param content_len JSON content length (if 0 length will be recalculated via strlen())
- * @param strict_mode true - stick to JSON spec, false - allowing comments, trailing commas, nan
- * @return
- */
-Exception
-cex_json__iter__create(json_iter_c* it, char* content, usize content_len, bool strict_mode)
-{
-    uassert(it != NULL);
-    if (content == NULL) { return Error.argument; }
-    *it = (json_iter_c){
-        ._impl = {
-            .strict_mode = strict_mode,
-            .lexer = CexParser.create(content, content_len, false),
-        },
-    };
-    if (it->_impl.lexer.content == it->_impl.lexer.content_end) { return Error.empty; }
-    return EOK;
-}
-
-/**
- * @brief Make step inside JSON object or array scope (json.iter.next() starts emitting this scope)
- *
- * @param it
- * @param expected_type Expected scope type (for sanity checks)
- * @return
- */
-Exception
-cex_json__iter__step_in(json_iter_c* it, JsonType_e expected_type)
-{
-    if (unlikely(it->error != EOK)) { goto error; }
-    if (unlikely(it->_impl.scope_depth >= sizeof(it->_impl.scope_stack) - 1)) {
-        it->error = "JSON Scope nesting overflow";
-        goto error;
-    }
-    if (unlikely(expected_type <= 0 || it->type != expected_type)) {
-        it->error = "Unexpected type for stepping in";
-        goto error;
-    }
-
-    if (it->type == JsonType__obj) {
-        uassert(it->_impl.curr_token == CexTkn__lbrace);
-        it->_impl.scope_stack[it->_impl.scope_depth] = '{';
-        it->_impl.scope_depth++;
-    } else if (it->type == JsonType__arr) {
-        uassert(it->_impl.curr_token == CexTkn__lbracket);
-        it->_impl.scope_stack[it->_impl.scope_depth] = '[';
-        it->_impl.scope_depth++;
-    } else {
-        // return json.iter.next(it);
-        it->error = "Stepping in is only for objects or arrays";
-        goto error;
-    }
-    // json.iter.next() is going to check if we step in or skipping whole block
-    it->_impl.prev_token = it->_impl.curr_token;
-    it->_impl.curr_token = CexTkn__unk;
-    it->_impl.has_items = false;
-    return it->error;
-
-error:
-    it->type = JsonType__err;
-    it->val = (str_s){ 0 };
-    it->key = (str_s){ 0 };
-    return it->error;
-}
-
-/**
- * @brief Early step out from JSON scope (you must immediately break the loop/func after step out)
- *
- * After calling step out, next call of `json.iter.next()` will return outer scope item,
- * make sure that you also break the loop or exiting parsing function for current scope.
- *
- * @param it
- * @return
- */
-Exception
-cex_json__iter__step_out(json_iter_c* it)
-{
-    if (unlikely(it->_impl.scope_depth == 0)) {
-        it->error = "Bad scope/level for step out";
-        return it->error;
-    }
-    u32 scope_depth_initial = it->_impl.scope_depth - 1;
-    while (it->_impl.scope_depth > scope_depth_initial && json.iter.next(it)) {}
-    return it->error;
-}
-
-static Exc
-_cex_json__iter__skip(json_iter_c* it)
-{
-    // Simulate full step-in/next sequence for all nested stuff (because it serves as syntax check)
-    u32 scope_depth_initial = it->_impl.scope_depth;
-    if (json.iter.step_in(it, it->type)) { return it->error; }
-
-    while (it->_impl.scope_depth > scope_depth_initial) {
-        if (!json.iter.next(it) && it->error) { break; }
-        switch (it->type) {
-            case JsonType__arr:
-            case JsonType__obj:
-                if (json.iter.step_in(it, it->type)) { return it->error; }
-            default:
-                break;
-        }
-    }
-    return it->error;
-}
-
-/**
- * @brief Get next JSON item for a scope
- *
- * @param it
- * @return false - on end of file, error, or json.iter.step_in() scope
- */
-bool
-cex_json__iter__next(json_iter_c* it)
-{
-    if (unlikely(it->error != EOK)) { goto error; }
-    it->key = (str_s){ 0 };
-
-    if (unlikely(
-            it->_impl.curr_token == CexTkn__lbrace || it->_impl.curr_token == CexTkn__lbracket
-        )) {
-        // User didn't step into object/array, skipping it
-        if (_cex_json__iter__skip(it) != EOK) { goto error; }
-    }
-
-    cex_token_s t = $next_tok();
-    if (it->_impl.scope_depth == 0 && t.type != CexTkn__eof) {
-        if (it->_impl.has_items) {
-            // Additional items after end of previous scope
-            goto error_unexpected;
-        } else {
-            it->_impl.has_items = true;
-        }
-    }
-    if (it->_impl.scope_depth > 0) {
-        if (it->_impl.scope_stack[it->_impl.scope_depth - 1] == '{') {
-            // OBJECT: {"foo": "bar"}
-            switch (t.type) {
-                case CexTkn__comma: {
-                    // Comma from previous item
-                    if (it->_impl.prev_token == CexTkn__lbrace ||
-                        it->_impl.prev_token == CexTkn__colon || !it->_impl.has_items) {
-                        goto error_unexpected;
-                    }
-                    t = $next_tok();
-                    if (t.type == CexTkn__rbrace) {
-                        goto parse_generic;
-                    } else if (t.type != CexTkn__string) {
-                        goto error_unexpected;
-                    }
-                    fallthrough(); // we get another key: value
-                }
-                case CexTkn__string: {
-                    // Getting key of a object
-                    it->key = t.value;
-                    t = $next_tok();
-                    if (t.type != CexTkn__colon) { goto error_unexpected; }
-                    t = $next_tok();
-                    it->_impl.has_items = true;
-                    goto parse_generic; // parsing value
-                }
-                default: {
-                    goto parse_generic;
-                }
-            }
-        } else if (it->_impl.scope_stack[it->_impl.scope_depth - 1] == '[') {
-            // ARRAY: ["foo", "bar"]
-            switch (t.type) {
-                case CexTkn__rbracket: {
-                    goto parse_generic;
-                }
-                case CexTkn__comma: {
-                    if (!it->_impl.has_items) { goto error_unexpected; }
-                    t = $next_tok();
-                    goto parse_generic;
-                }
-                default: {
-                    if (it->_impl.has_items && it->_impl.prev_token != CexTkn__comma) {
-                        goto error_unexpected;
-                    }
-                    it->_impl.has_items = true;
-                    goto parse_generic;
-                }
-            }
-        } else {
-            it->error = "Unexpected scope char";
-            goto error;
-        }
-    }
-
-parse_generic:
-    // Parsing generic value
-    switch (t.type) {
-        case CexTkn__lbrace: {
-            it->type = JsonType__obj;
-            it->val = (str_s){ 0 };
-            goto end;
-        }
-        case CexTkn__lbracket: {
-            it->type = JsonType__arr;
-            it->val = (str_s){ 0 };
-            goto end;
-        }
-        case CexTkn__rbrace: {
-            if (it->_impl.scope_depth > 0 &&
-                it->_impl.scope_stack[it->_impl.scope_depth - 1] == '{') {
-                if (it->_impl.strict_mode && it->_impl.prev_token == CexTkn__comma) {
-                    it->error = "Ending comma in object";
-                    goto error;
-                }
-                it->_impl.scope_stack[it->_impl.scope_depth - 1] = '\0';
-                it->_impl.scope_depth--;
-                it->type = JsonType__eos;
-                it->val = (str_s){ 0 };
-                if (it->_impl.scope_depth == 0) { it->_impl.has_items = true; }
-                goto end;
-            } else {
-                goto error_unexpected;
-            }
-        }
-        case CexTkn__rbracket: {
-            if (it->_impl.scope_depth > 0 &&
-                it->_impl.scope_stack[it->_impl.scope_depth - 1] == '[') {
-                if (it->_impl.strict_mode && it->_impl.prev_token == CexTkn__comma) {
-                    it->error = "Ending comma in array";
-                    goto error;
-                }
-                it->_impl.scope_stack[it->_impl.scope_depth - 1] = '\0';
-                it->_impl.scope_depth--;
-                it->type = JsonType__eos;
-                it->val = (str_s){ 0 };
-                if (it->_impl.scope_depth == 0) { it->_impl.has_items = true; }
-                goto end;
-            } else {
-                goto error_unexpected;
-            }
-        }
-        case CexTkn__comment_multi:
-        case CexTkn__comment_single: {
-            uassert(it->_impl.strict_mode);
-            goto error_unexpected;
-        }
-        case CexTkn__string: {
-            it->type = JsonType__str;
-            it->val = t.value;
-            goto end;
-        }
-        case CexTkn__plus:
-            if (it->_impl.strict_mode) { goto error_unexpected; }
-            fallthrough();
-        case CexTkn__minus: {
-            char* sign = t.value.buf;
-            t = $next_tok();
-            if (t.type != CexTkn__number) {
-                // Handling -inf/+Inf
-                if (!(!it->_impl.strict_mode && t.type == CexTkn__ident &&
-                      str.slice.eqi(t.value, str$s("inf")))) {
-                    goto error_unexpected;
-                }
-            }
-            if (t.value.buf - sign != 1) { goto error_unexpected; }   // no whitespace allowed!
-            t.value = (str_s){ .buf = sign, .len = t.value.len + 1 }; // extend including sign
-        }
-            fallthrough();
-        case CexTkn__number: {
-            it->type = JsonType__num;
-            it->val = t.value;
-            goto end;
-        }
-        case CexTkn__eof: {
-            if (it->_impl.scope_depth == 0) {
-                it->type = JsonType__eof;
-                it->val = (str_s){ 0 };
-                goto end;
-            } else {
-                goto error_unexpected;
-            }
-        }
-        case CexTkn__ident: {
-            if (str.slice.eq(t.value, str$s("null"))) {
-                it->type = JsonType__null;
-            } else if (str.slice.eq(t.value, str$s("true")) ||
-                       str.slice.eq(t.value, str$s("false"))) {
-                it->type = JsonType__bool;
-            } else {
-                if (!it->_impl.strict_mode) {
-                    if (!(str.slice.eqi(t.value, str$s("nan")) ||
-                          str.slice.eqi(t.value, str$s("inf")))) {
-                        goto error_unexpected;
-                    }
-                    it->type = JsonType__num;
-                } else {
-                    goto error_unexpected;
-                }
-            }
-            it->val = t.value;
-            goto end;
-        }
-        default: {
-            goto error_unexpected;
-        }
-    }
-    unreachable();
-
-end:
-    return it->type > 0;
-
-error_unexpected:
-    it->error = "Unexpected token";
-error:
-    it->type = JsonType__err;
-    it->key = (str_s){ 0 };
-    it->val = (str_s){ 0 };
-    goto end;
-}
-
-#define $print(format, ...) /* temp macro */                                                       \
-    ({                                                                                             \
-        if (jb->error == EOK) {                                                                    \
-            Exc err = sbuf.appendf(&jb->buf, format, __VA_ARGS__);                                 \
-            if (unlikely(err != EOK && jb->error == EOK)) { jb->error = err; }                     \
-        }                                                                                          \
-    })
-
-#define $printva() /* temp macro! */                                                               \
-    if (jb->error == EOK) {                                                                        \
-        va_list va;                                                                                \
-        va_start(va, format);                                                                      \
-        Exc err = sbuf.appendfva(&jb->buf, format, va);                                            \
-        if (unlikely(err != EOK && jb->error != EOK)) { jb->error = err; }                         \
-        va_end(va);                                                                                \
-    }
-
-
-void
-_cex__jsonbuf_indent(json_buf_c* jb)
-{
-    if (unlikely(jb->error != EOK)) { return; }
-    for (u32 i = 0; i < jb->indent; i++) { $print(" ", ""); }
-}
-
-/**
- * @brief Create JSON buffer/builder container used with json$buf / json$fmt / json$kstr macros
- *
- * @param jb
- * @param capacity initial capacity of buffer (will be resized if not enough)
- * @param indent JSON indentation (0 - to produce minified version)
- * @param allc allocator for buffer
- * @return
- */
-Exception
-cex_json__buf__create(json_buf_c* jb, u32 capacity, u8 indent, IAllocator allc)
-{
-    e$assert(jb != NULL);
-    e$assert(allc != NULL);
-
-    *jb = (json_buf_c){
-        .indent_width = indent,
-        .buf = sbuf.create(capacity, allc),
-    };
-    return EOK;
-}
-
-/**
- * @brief Destroy JSON buffer instance (not necessary to call if initialized on tmem$ allocator)
- *
- * @param jb
- */
-void
-cex_json__buf__destroy(json_buf_c* jb)
-{
-    if (jb != NULL) {
-        if (jb->buf != NULL) { sbuf.destroy(&jb->buf); }
-        memset(jb, 0, sizeof(*jb));
-    }
-}
-
-/**
- * @brief Get JSON buffer contents (NULL if any error occurred)
- *
- * @param jb
- * @return
- */
-char*
-cex_json__buf__get(json_buf_c* jb)
-{
-    if (jb->error != EOK) {
-        return NULL;
-    } else {
-        return jb->buf;
-    }
-}
-
-/**
- * @brief Check if there is any error in JSON buffer
- *
- * @param jb
- * @return
- */
-Exception
-cex_json__buf__validate(json_buf_c* jb)
-{
-    return jb->error;
-}
-
-void
-_cex_json__buf__clear(json_buf_c* jb)
-{
-    uassert(jb);
-    uassert(jb->buf != NULL && "uninitialized or already destroyed");
-
-    sbuf.clear(&jb->buf);
-    jb->indent = 0;
-    jb->error = EOK;
-    if (jb->scope_depth > 0) {
-        jb->scope_depth = 0;
-        memset(jb->scope_stack, 0, sizeof(jb->scope_stack));
-    }
-}
-
-void
-_cex_json__buf__print(json_buf_c* jb, char* format, ...)
-{
-    _cex__jsonbuf_indent(jb);
-    $printva();
-}
-
-void
-_cex_json__buf__print_item(json_buf_c* jb, char* format, ...)
-{
-    uassertf(
-        jb->scope_depth > 0 && jb->scope_stack[jb->scope_depth - 1] == '[',
-        "Expected to be in json array scope"
-    );
-    _cex__jsonbuf_indent(jb);
-    $printva();
-    $print(",%s", (jb->indent_width > 0) ? "\n" : " ");
-}
-
-void
-_cex_json__buf__print_key(json_buf_c* jb, char* key, char* format, ...)
-{
-    uassertf(
-        jb->scope_depth > 0 && jb->scope_stack[jb->scope_depth - 1] == '{',
-        "Expected to be in json object scope"
-    );
-    _cex__jsonbuf_indent(jb);
-    $print("\"%s\": ", key);
-    $printva();
-    $print(",%s", (jb->indent_width > 0) ? "\n" : " ");
-}
-
-json_buf_c*
-_cex__jsonbuf_print_scope_enter(json_buf_c* jb, JsonType_e scope_type)
-{
-    usize slen = sbuf.len(&jb->buf);
-    if (slen && jb->buf[slen - 1] == '\n') { _cex__jsonbuf_indent(jb); }
-    if (scope_type == JsonType__obj) {
-        $print("%c%s", '{', (jb->indent_width > 0) ? "\n" : "");
-        if (jb->scope_depth <= sizeof(jb->scope_stack) - 1) {
-            jb->scope_stack[jb->scope_depth] = '{';
-            jb->scope_depth++;
-        } else {
-            jb->error = "Scope overflow";
-        }
-    } else if (scope_type == JsonType__arr) {
-        $print("%c%s", '[', (jb->indent_width > 0) ? "\n" : "");
-        if (jb->scope_depth <= sizeof(jb->scope_stack) - 1) {
-            jb->scope_stack[jb->scope_depth] = '[';
-            jb->scope_depth++;
-        } else {
-            jb->error = "Scope overflow";
-        }
-    } else {
-        unreachable("Only JsonType__obj or JsonType__arr expected");
-    }
-    jb->indent += jb->indent_width;
-    return jb;
-}
-
-void
-_cex__jsonbuf_print_scope_exit(json_buf_c** jbptr)
-{
-    uassert(*jbptr != NULL);
-    json_buf_c* jb = *jbptr;
-
-    if (jb->indent >= jb->indent_width) { jb->indent -= jb->indent_width; }
-    if (jb->scope_depth > 0) {
-        // Removing last comma
-        usize slen = sbuf.len(&jb->buf);
-        if (slen > 0) {
-            bool has_new_line = false;
-            for (u32 i = slen; --i > 0;) {
-                char c = jb->buf[i];
-                switch (c) {
-                    case '\n':
-                        has_new_line = true;
-                        break;
-                    case ' ':
-                    case '\t':
-                    case '\r':
-                        break; // skip whitespace
-                    case ',':
-                        sbuf.shrink(&jb->buf, i);
-                        if (has_new_line) {
-                            e$except_silent (err, sbuf.append(&jb->buf, "\n")) {
-                                if (jb->error == EOK) { jb->error = err; }
-                            }
-                        }
-                        goto loop_break;
-                    default:
-                        goto loop_break;
-                }
-            }
-        }
-    loop_break:
-        _cex__jsonbuf_indent(jb);
-
-        $print(
-            "%c%s%s",
-            (jb->scope_stack[jb->scope_depth - 1] == '[') ? ']' : '}',
-            (jb->scope_depth > 1) ? "," : "",
-            (jb->indent_width > 0) ? "\n" : ""
-        );
-        jb->scope_depth--;
-    } else {
-        jb->error = "Scope overflow";
-    }
-}
-
-#undef $next_tok /* TEMP MACRO */
-#undef $print
-#undef $printva
-
-const struct __cex_namespace__json json = {
-    // Autogenerated by CEX
-    // clang-format off
-
-
-    .buf = {
-        .create = cex_json__buf__create,
-        .destroy = cex_json__buf__destroy,
-        .get = cex_json__buf__get,
-        .validate = cex_json__buf__validate,
-    },
-
-    .iter = {
-        .create = cex_json__iter__create,
-        .next = cex_json__iter__next,
-        .step_in = cex_json__iter__step_in,
-        .step_out = cex_json__iter__step_out,
-    },
-
-    // clang-format on
-};
-
-
-
-/*
 *                          src/cex_maker.c
 */
 #if defined(CEX_NEW)
@@ -17818,6 +18886,7 @@ main(int argc, char** argv)
 *                          src/fuzz.c
 */
 
+/// Creates new fuzz data generator, for fuzz-driven randomization
 cex_fuzz_s
 cex_fuzz_create(const u8* data, usize size)
 {
@@ -17827,6 +18896,7 @@ cex_fuzz_create(const u8* data, usize size)
     };
 }
 
+/// Get result from random data into buffer (returns false if not enough data)
 bool
 cex_fuzz_dget(cex_fuzz_s* fz, void* out_result, usize result_size)
 {
@@ -17837,6 +18907,7 @@ cex_fuzz_dget(cex_fuzz_s* fz, void* out_result, usize result_size)
     return true;
 }
 
+/// Get current corpus dir relative tho the `this_file_name`
 char*
 cex_fuzz_corpus_dir(char* this_file_name)
 {
@@ -17858,6 +18929,7 @@ cex_fuzz_corpus_dir(char* this_file_name)
     return buf;
 }
 
+/// Get probability using fuzz data, based on threshold
 bool
 cex_fuzz_dprob(cex_fuzz_s* fz, double threshold)
 {
@@ -17885,6 +18957,54 @@ const struct __cex_namespace__fuzz fuzz = {
 
     // clang-format on
 };
+
+
+
+/*
+*                          src/cex_footer.c
+*/
+/*
+## Credits
+
+CEX contains some code and ideas from the following projects, all of them licensed under MIT license (or Public Domain):
+
+1. [nob.h](https://github.com/tsoding/nob.h) - by Tsoding / Alexey Kutepov, MIT/Public domain, great idea of making self-contained build system, great youtube channel btw
+2. [stb_ds.h](https://github.com/nothings/stb/blob/master/stb_ds.h) - MIT/Public domain, by Sean Barrett, CEX arr$/hm$ are refactored versions of STB data structures, great idea 
+3. [stb_sprintf.h](https://github.com/nothings/stb/blob/master/stb_sprintf.h) - MIT/Public domain, by Sean Barrett, I refactored it, fixed all UB warnings from UBSAN, added CEX specific formatting
+4. [minirent.h](https://github.com/tsoding/minirent) - Alexey Kutepov, MIT license, WIN32 compatibility lib 
+5. [subprocess.h](https://github.com/sheredom/subprocess.h) - by Neil Henning, public domain, used in CEX as a daily driver for `os$cmd` and process communication
+6. [utest.h](https://github.com/sheredom/utest.h) - by Neil Henning, public domain, CEX test$ runner borrowed some ideas of macro magic for making declarative test cases
+7. [c3-lang](https://github.com/c3lang/c3c) - I borrowed some ideas about language features from C3, especially `mem$scope`, `mem$`/`tmem$` global allocators, scoped macros too.
+
+
+## License
+
+```
+
+MIT License
+
+Copyright (c) 2024-2025 Aleksandr Vedeneev
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+```
+*/
 
 
 

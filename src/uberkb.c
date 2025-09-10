@@ -31,7 +31,7 @@ main(int argc, char** argv)
             },
             .mouse_key_code = KEY_LEFTMETA,
             .mouse_sensitivity = 1.0,
-            .mouse_speedup_ms = 400,
+            .mouse_speedup_ms = 700,
             .mouse_map = {
                 // Buttons
                 [KEY_SPACE] = BTN_LEFT,
