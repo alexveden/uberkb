@@ -385,18 +385,18 @@ KeyMap_handle_key(KeyMap_c* self, struct input_event* ev)
             }
         }
 
-        if (self->mod_key_code && ev->code == self->mod_key_code) {
+        if (self->mod_key_code && ev->type == EV_KEY && ev->code == self->mod_key_code) {
             self->mod_pressed = ev->value > 0;
+            log$trace("Mod state: %d\n", self->mod_pressed);
 
             if (!self->mod_pressed && self->last_key_mod) {
                 // Special case (bug) when MOD key released before arrow key,
                 //   it was leading to infinite key loop
-                if (self->debug) {
-                    printf(
-                        "Unpress last mapped key: %s\n",
-                        libevdev_event_code_get_name(EV_KEY, self->last_key_mod)
-                    );
-                }
+                log$trace(
+                    "Unpress last mapped key: %s\n",
+                    libevdev_event_code_get_name(EV_KEY, self->last_key_mod)
+                );
+
                 ev->type = EV_SYN;
                 ev->code = SYN_REPORT;
                 ev->value = 0;
@@ -416,10 +416,16 @@ KeyMap_handle_key(KeyMap_c* self, struct input_event* ev)
             }
         } else {
             if (self->mod_pressed) {
+
+                log$trace(
+                    "Mod pressed + %s\n",
+                    libevdev_event_code_get_name(ev->type, ev->code)
+                );
+
                 if (self->mod_map[ev->code]) {
                     ev->code = self->mod_map[ev->code];
 
-                    if (ev->type == EV_KEY && ev->value == 2) {
+                    if (ev->type == EV_KEY && ev->value > 0) {
                         // NOTE: to be unpressed when mod released before key (using mod code!)
                         self->last_key_mod = ev->code;
                     }
@@ -431,6 +437,10 @@ KeyMap_handle_key(KeyMap_c* self, struct input_event* ev)
                     e$except_errno (write(self->output.fd, ev, sizeof(*ev))) { return Error.io; }
                 }
             } else if (self->mouse_pressed) {
+                log$trace(
+                    "Mouse pressed + %s\n",
+                    libevdev_event_code_get_name(ev->type, ev->code)
+                );
                 if (self->mouse_map[ev->code]) {
                     switch (self->mouse_map[ev->code]) {
                         case BTN_LEFT:
@@ -465,6 +475,7 @@ KeyMap_handle_key(KeyMap_c* self, struct input_event* ev)
                     e$except_errno (write(self->output.fd, ev, sizeof(*ev))) { return Error.io; }
                 }
             } else {
+                log$trace("Direct %s\n", libevdev_event_code_get_name(ev->type, ev->code));
                 ev->code = self->direct_map[ev->code] ? self->direct_map[ev->code] : ev->code;
                 e$except_errno (write(self->output.fd, ev, sizeof(*ev))) { return Error.io; }
             }

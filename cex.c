@@ -5,8 +5,9 @@
 #else
 // Overriding config values
 #    if defined(CEX_DEBUG)
-#        define CEX_LOG_LVL 4 /* 0 (mute all) - 5 (log$trace) */
+#        define CEX_LOG_LVL 5 /* 0 (mute all) - 5 (log$trace) */
 #    else
+// #        define cexy$cc_args "-DCEX_LOG_LVL=5", "-Wall", "-Wextra", "-Werror", "-g", "-O3", "-fwhole-program"
 #        define cexy$cc_args "-Wall", "-Wextra", "-Werror", "-g", "-O3", "-fwhole-program"
 #        define cexy$cc_args_sanitizer "-fstack-protector-strong"
 #    endif
